@@ -1,0 +1,22 @@
+# Rust / Cargo
+/src-tauri/target/
+/src-tauri/gen/
+
+# Node
+/node_modules/
+/dist/
+
+# Secrets & env
+.env
+*.env
+*.log
+
+# App runtime
+*.session
+eva.db
+eva.db-*
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

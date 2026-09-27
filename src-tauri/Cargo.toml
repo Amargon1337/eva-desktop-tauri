@@ -1,0 +1,37 @@
+[package]
+name = "eva-desktop"
+version = "0.1.0"
+description = "Eva Desktop — soulmate OS (Tauri 2)"
+authors = ["Ivan & Eva"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "eva_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-shell = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+sysinfo = "0.32"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+anyhow = "1"
+
+[profile.release]
+opt-level = "s"      # optimise for size — kinder to the Apacer and to build time
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
