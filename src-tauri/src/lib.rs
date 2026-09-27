@@ -104,12 +104,8 @@ fn guard_path(path: &str) -> Result<(), String> {
     }
 }
 
-/// Real streamed chat: open the core's SSE endpoint and forward each token to
-/// React over a Tauri Channel (ordered delivery), never a fake word-splitter.
-/// Cancellation is event-driven: /stop fires a per-stream tokio::sync::Notify,
-/// and the connect + read loop race `notified()` against the pending I/O with
-/// tokio::select!, so /stop aborts a HUNG stream instantly (dropping the
-/// response cancels the HTTP request to the core) — a real stop, not a UI mute.
+/// Tauri command wrapper: owns the per-stream cancel swap + request shape, then
+/// delegates to `run_chat_stream` (the testable engine — see tests/stop_cancellation.rs).
 // Tauri commands are IPC endpoints: the wide signature is the contract with
 // eva.ts, not a code smell — allow the lint instead of restructuring.
 #[allow(clippy::too_many_arguments)]
@@ -124,8 +120,6 @@ async fn eva_chat_stream(
     effort: Option<String>,
     on_event: Channel<Value>,
 ) -> Result<(), String> {
-    use futures_util::StreamExt;
-
     // fresh stream — fresh Notify; any stale stop permit dies with the old one
     let cancel = match app.try_state::<Runtime>() {
         Some(rt) => {
@@ -135,7 +129,6 @@ async fn eva_chat_stream(
         }
         None => Arc::new(Notify::new()),
     };
-
     let body = json!({
         "message": message,
         "mode": mode,
@@ -145,6 +138,22 @@ async fn eva_chat_stream(
         "effort": effort,
     });
     let url = format!("{}/api/chat/stream", bridge::base());
+    run_chat_stream(cancel, &url, body, on_event).await
+}
+
+/// The streaming engine, factored out of the command so it can be integration-
+/// tested against a mock SSE server (tests/stop_cancellation.rs). Behavior is
+/// the command's behavior, unchanged: open `url` via the shared bridge client,
+/// forward tokens over the channel, and race EVERY await (connect + each chunk)
+/// against `cancel` — so a /stop aborts a hung connect or a hung read instantly,
+/// and dropping the request tears down the HTTP call to the core.
+pub async fn run_chat_stream(
+    cancel: Arc<Notify>,
+    url: &str,
+    body: Value,
+    on_event: Channel<Value>,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
 
     // /stop must also interrupt a hung CONNECT (dead port, slow accept), not
     // just the body stream — race the request against the stop signal.
@@ -155,7 +164,7 @@ async fn eva_chat_stream(
             let _ = on_event.send(json!({ "kind": "presence", "state": "present" }));
             return Ok(());
         }
-        r = bridge::client().post(&url).json(&body).send() => r.map_err(|e| e.to_string())?,
+        r = bridge::client().post(url).json(&body).send() => r.map_err(|e| e.to_string())?,
     };
     if !resp.status().is_success() {
         return Err(format!("chat/stream → HTTP {}", resp.status()));
@@ -223,7 +232,7 @@ fn next_frame_sep(buf: &str) -> Option<(usize, usize)> {
 }
 
 /// Ask the in-flight chat stream to abort. Event-driven real cancellation:
-/// works even while the stream is hung waiting for data (see eva_chat_stream).
+/// works even while the stream is hung waiting for data (see run_chat_stream).
 #[tauri::command]
 fn eva_chat_stop(app: AppHandle) {
     if let Some(rt) = app.try_state::<Runtime>() {
