@@ -28,6 +28,7 @@ sysinfo = "0.32"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 anyhow = "1"
+url = "2"
 
 [profile.release]
 opt-level = "s"      # optimise for size — kinder to the Apacer and to build time

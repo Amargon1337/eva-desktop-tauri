@@ -15,11 +15,12 @@ mod db;
 
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 use tauri::{
     ipc::Channel,
     menu::{Menu, MenuItem},
@@ -31,15 +32,25 @@ use tauri_plugin_notification::NotificationExt;
 use db::Db;
 
 // ── shared app state ─────────────────────────────────────────────────────────
-#[derive(Default)]
 struct Runtime {
     /// The Hermes child WE launched (so we only ever kill our own, and we can
     /// reap it on exit). None = we attached to Ivan's already-running core.
     child: Mutex<Option<Child>>,
-    /// Set true to ask the in-flight chat stream to abort. A fresh stream clears
-    /// it; /stop sets it; the SSE loop checks it and drops the HTTP response
-    /// (which cancels the request to the core), so /stop is a REAL stop.
-    cancel_chat: std::sync::atomic::AtomicBool,
+    /// Per-stream stop signal. /stop clones the CURRENT Notify and fires it;
+    /// the stream loop races `notified()` against the next SSE chunk with
+    /// tokio::select!, so a stop interrupts a HUNG stream (no data flowing)
+    /// immediately instead of waiting for the next chunk. Each stream swaps in
+    /// a fresh Notify, so a stale permit can never cancel a later stream.
+    chat_cancel: Mutex<Arc<Notify>>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            child: Mutex::new(None),
+            chat_cancel: Mutex::new(Arc::new(Notify::new())),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -95,8 +106,13 @@ fn guard_path(path: &str) -> Result<(), String> {
 
 /// Real streamed chat: open the core's SSE endpoint and forward each token to
 /// React over a Tauri Channel (ordered delivery), never a fake word-splitter.
-/// Cancellable: /stop flips Runtime.cancel_chat and the loop drops the response,
-/// which cancels the HTTP request to the core — a real stop, not a UI mute.
+/// Cancellation is event-driven: /stop fires a per-stream tokio::sync::Notify,
+/// and the connect + read loop race `notified()` against the pending I/O with
+/// tokio::select!, so /stop aborts a HUNG stream instantly (dropping the
+/// response cancels the HTTP request to the core) — a real stop, not a UI mute.
+// Tauri commands are IPC endpoints: the wide signature is the contract with
+// eva.ts, not a code smell — allow the lint instead of restructuring.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn eva_chat_stream(
     app: AppHandle,
@@ -109,12 +125,16 @@ async fn eva_chat_stream(
     on_event: Channel<Value>,
 ) -> Result<(), String> {
     use futures_util::StreamExt;
-    use std::sync::atomic::Ordering;
 
-    // fresh stream — clear any stale cancel flag
-    if let Some(rt) = app.try_state::<Runtime>() {
-        rt.cancel_chat.store(false, Ordering::SeqCst);
-    }
+    // fresh stream — fresh Notify; any stale stop permit dies with the old one
+    let cancel = match app.try_state::<Runtime>() {
+        Some(rt) => {
+            let fresh = Arc::new(Notify::new());
+            *rt.chat_cancel.lock().unwrap() = fresh.clone();
+            fresh
+        }
+        None => Arc::new(Notify::new()),
+    };
 
     let body = json!({
         "message": message,
@@ -125,12 +145,18 @@ async fn eva_chat_stream(
         "effort": effort,
     });
     let url = format!("{}/api/chat/stream", bridge::base());
-    let resp = bridge::client()
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+
+    // /stop must also interrupt a hung CONNECT (dead port, slow accept), not
+    // just the body stream — race the request against the stop signal.
+    let resp = tokio::select! {
+        biased;
+        _ = cancel.notified() => {
+            let _ = on_event.send(json!({ "kind": "done", "reply": Value::Null, "aborted": true }));
+            let _ = on_event.send(json!({ "kind": "presence", "state": "present" }));
+            return Ok(());
+        }
+        r = bridge::client().post(&url).json(&body).send() => r.map_err(|e| e.to_string())?,
+    };
     if !resp.status().is_success() {
         return Err(format!("chat/stream → HTTP {}", resp.status()));
     }
@@ -138,23 +164,26 @@ async fn eva_chat_stream(
     let _ = on_event.send(json!({ "kind": "presence", "state": "thinking" }));
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
-    while let Some(chunk) = stream.next().await {
-        // cancellation check — dropping `stream`/`resp` aborts the request
-        if let Some(rt) = app.try_state::<Runtime>() {
-            if rt.cancel_chat.load(Ordering::SeqCst) {
-                rt.cancel_chat.store(false, Ordering::SeqCst);
-                drop(stream);
+    loop {
+        // Wait for the next chunk OR a stop — whichever comes first. Dropping
+        // `stream`/`resp` aborts the HTTP request to the core.
+        let chunk = tokio::select! {
+            biased;
+            _ = cancel.notified() => {
                 let _ = on_event.send(json!({ "kind": "done", "reply": Value::Null, "aborted": true }));
                 let _ = on_event.send(json!({ "kind": "presence", "state": "present" }));
                 return Ok(());
             }
-        }
-        let chunk = chunk.map_err(|e| e.to_string())?;
+            next = stream.next() => match next {
+                Some(c) => c.map_err(|e| e.to_string())?,
+                None => break, // stream ended without an explicit done frame
+            },
+        };
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        // SSE frames are separated by a blank line
-        while let Some(idx) = buf.find("\n\n") {
+        // SSE frames are separated by a blank line (LF or CRLF)
+        while let Some((idx, seplen)) = next_frame_sep(&buf) {
             let frame = buf[..idx].to_string();
-            buf.drain(..idx + 2);
+            buf.drain(..idx + seplen);
             for line in frame.lines() {
                 let line = line.trim();
                 if let Some(payload) = line.strip_prefix("data:") {
@@ -182,11 +211,24 @@ async fn eva_chat_stream(
     Ok(())
 }
 
-/// Ask the in-flight chat stream to abort (real cancellation).
+/// Earliest SSE frame separator in `buf` — "\n\n" or "\r\n\r\n". Returns the
+/// byte index where the frame ends and the separator length.
+fn next_frame_sep(buf: &str) -> Option<(usize, usize)> {
+    match (buf.find("\n\n"), buf.find("\r\n\r\n")) {
+        (Some(a), Some(b)) => Some(if a <= b { (a, 2) } else { (b, 4) }),
+        (Some(a), None) => Some((a, 2)),
+        (None, Some(b)) => Some((b, 4)),
+        (None, None) => None,
+    }
+}
+
+/// Ask the in-flight chat stream to abort. Event-driven real cancellation:
+/// works even while the stream is hung waiting for data (see eva_chat_stream).
 #[tauri::command]
 fn eva_chat_stop(app: AppHandle) {
     if let Some(rt) = app.try_state::<Runtime>() {
-        rt.cancel_chat.store(true, std::sync::atomic::Ordering::SeqCst);
+        let cancel = rt.chat_cancel.lock().unwrap().clone();
+        cancel.notify_one();
     }
 }
 
@@ -214,7 +256,9 @@ fn bridge_url_from_db(app: &AppHandle) -> String {
 ///   1. EVA_HERMES_HOME / HERMES_HOME env
 ///   2. %LOCALAPPDATA%\hermes
 ///   3. ~/.hermes
+///
 /// server.py: EVA_SERVER_PY env → C:\Tools\eva-desktop\server.py → <home>\eva-desktop\server.py
+///
 /// Picks the first home that yields a VALID runtime (venv python + server.py both
 /// exist), not merely the first home directory that exists.
 fn discover_runtime() -> Option<(PathBuf, PathBuf, PathBuf)> {
@@ -591,6 +635,13 @@ pub fn run() {
             local_presence,
             notify,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Eva Desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building Eva Desktop")
+        // reap the Hermes child we launched on EVERY exit path (tray quit, OS
+        // shutdown, panic-free exit events) — not just the tray menu handler.
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                reap_runtime(app_handle);
+            }
+        });
 }

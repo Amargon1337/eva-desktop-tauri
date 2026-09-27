@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
+use url::Url;
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -25,33 +26,42 @@ pub fn base() -> String {
     }
 }
 
-/// Only http(s) to loopback is allowed. A WebView XSS (or a poisoned eva.db
-/// setting) must never be able to point the bridge at a remote host and
+/// Only http(s) to a loopback host is allowed. A WebView XSS (or a poisoned
+/// eva.db setting) must never be able to point the bridge at a remote host and
 /// exfiltrate memory. Returns false for anything not local.
+///
+/// Uses the `url` crate's RFC 3986 parser — NOT hand-rolled string slicing — so
+/// userinfo tricks (`http://127.0.0.1:8770@evil.com`), IPv4-in-IPv6
+/// (`http://[::ffff:8.8.8.8]/`), octal/decimal IP encodings and friends are
+/// parsed correctly: the userinfo before `@` lands in url.username(), the
+/// REAL host is in url.host_str().
 pub fn is_local_url(u: &str) -> bool {
-    let lower = u.to_ascii_lowercase();
-    let rest = match lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://")) {
-        Some(r) => r,
-        None => return false,
-    };
-    // host is up to the next ':' or '/'
-    let host: String = rest.chars().take_while(|c| *c != ':' && *c != '/').collect();
-    matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    let Ok(url) = Url::parse(u) else { return false };
+    // only http/https on the loopback interface
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return false;
+    }
+    // explicit rejection of userinfo: `http://127.0.0.1@evil.com` is NOT local —
+    // `127.0.0.1` would be the username, `evil.com` the actual host.
+    if url.username() != "" || url.password().is_some() {
+        return false;
+    }
+    let Some(host) = url.host_str() else { return false };
+    // Port isn't constrained: any loopback port is still loopback.
+    // IPv6 zone-ids ("fe80::1%eth0") and any other host form fail the match.
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
-/// (host, port) parsed from the current base, for handing to the spawned core.
-/// Defaults to 127.0.0.1:8770 when unparseable.
+/// (host, port) parsed from the current base with the `url` crate, for handing
+/// to the spawned core. Brackets are stripped from IPv6 for the host arg.
+/// Falls back to 127.0.0.1:8770 when unparseable (base() is loopback-validated
+/// already, so this only guards against a hand-corrupted env var).
 pub fn host_port() -> (String, u16) {
     let b = base();
-    let rest = b
-        .strip_prefix("http://")
-        .or_else(|| b.strip_prefix("https://"))
-        .unwrap_or(&b);
-    let authority: String = rest.chars().take_while(|c| *c != '/').collect();
-    // strip IPv6 brackets for the host arg, keep it simple for our loopback case
-    if let Some((h, p)) = authority.rsplit_once(':') {
-        if let Ok(port) = p.parse::<u16>() {
-            return (h.trim_matches(|c| c == '[' || c == ']').to_string(), port);
+    if let Ok(url) = Url::parse(&b) {
+        if let Some(host) = url.host_str() {
+            let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+            return (host.to_string(), port);
         }
     }
     ("127.0.0.1".to_string(), 8770)
