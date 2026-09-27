@@ -63,11 +63,17 @@ export default function ModelPicker({
 
   return (
     <div className="model-wrap" ref={wrapRef}>
-      <button className={`model-trigger ${chosen ? "model-trigger-set" : ""}`} onClick={() => setOpen((o) => !o)} title="Выбор модели и уровня рассуждений">
-        <Cpu size={13} /><span>{activeModel}</span>
-        <em className={`model-effort-badge ${effort === "off" ? "model-effort-off" : ""}`}>{effort === "off" ? "eff·off" : `eff·${effortLabel}`}</em>
-        <ChevronDown size={12} />
-      </button>
+      {/* two separate pills, Hermes-style: model · reasoning */}
+      <div className="model-pills">
+        <button className={`model-trigger ${chosen ? "model-trigger-set" : ""}`} onClick={() => setOpen((o) => !o)} title="Выбор модели">
+          <Cpu size={13} /><span>{activeModel}</span><ChevronDown size={12} />
+        </button>
+        <button className="model-trigger effort-trigger" onClick={() => setOpen((o) => !o)} title="Уровень рассуждений">
+          {effort === "off" ? <ZapOff size={12} /> : <Zap size={12} />}
+          <span>{effort === "off" ? "без рассуждений" : effortLabel}</span>
+          <ChevronDown size={12} />
+        </button>
+      </div>
 
       {open && (
         <div className="model-popover model-popover-wide">

@@ -17,6 +17,7 @@ import DiaryPane from "./components/DiaryPane";
 import SystemPane from "./components/SystemPane";
 import CapabilitiesPane from "./components/CapabilitiesPane";
 import ModelPicker from "./components/ModelPicker";
+import RichText from "./components/RichText";
 
 type Page = "chat" | "memory" | "prompt" | "diary" | "capabilities" | "system";
 
@@ -44,6 +45,27 @@ function EvaAvatar({ mode, className = "" }: { mode: Mode; className?: string })
 function TypingDots() { return <span className="typing-dots" aria-hidden="true"><i /><i /><i /></span>; }
 function formatTime() { return new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); }
 function tsToTime(ts: string) { try { return new Date(ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); } catch { return ""; } }
+
+// A persisted "user" row is often NOT something Ivan typed: the gateway injects
+// background-process notices ([IMPORTANT: …]), out-of-band markers, memory-context
+// blocks, and we append attach/▪shape wrappers. Clean those for display so the
+// thread shows what he actually said — not machine noise attributed to him.
+function isSystemNote(content: string): boolean {
+  const t = content.trimStart();
+  return t.startsWith("[IMPORTANT:") || t.startsWith("[OUT-OF-BAND") || t.startsWith("[System note");
+}
+function cleanUserContent(content: string): string {
+  let t = content;
+  // strip a recalled memory-context block if it ever leaked into the row
+  t = t.replace(/<memory-context>[\s\S]*?<\/memory-context>/gi, "");
+  // strip our own attach fold-ins — the chip already conveyed them
+  t = t.replace(/\n*\[Файл «[^»]*»[\s\S]*?\n\]/g, "");
+  t = t.replace(/\n*\[Изображение «[^»]*»[\s\S]*?\]/g, "");
+  // unwrap the classic USER MESSAGE envelope if present
+  const m = t.match(/---\s*USER MESSAGE BEGIN\s*---([\s\S]*?)---\s*USER MESSAGE END\s*---/);
+  if (m) t = m[1];
+  return t.trim();
+}
 function relDay(ts: string) {
   try {
     const d = new Date(ts); const now = new Date();
@@ -454,20 +476,35 @@ export default function App() {
                 <div className="thread-date"><span />ЖИВОЙ ПОТОК <span className="thread-date-dot">/</span> memory.db<span /></div>
                 {loadingHistory && messages.length === 0 && <div className="empty-thread"><span className="empty-symbol"><TypingDots /></span><h3>Поднимаю историю…</h3><p>читаю conversation из базы</p></div>}
                 {!loadingHistory && messages.length === 0 && <div className="empty-thread"><span className="empty-symbol"><BatMark size={28} /></span><h3>Начни с чего угодно.</h3><p>Мне не нужен идеальный первый вопрос.</p></div>}
-                {messages.map((m, idx) => m.role !== "assistant" ? (
-                  <motion.article className="message message-ivan" key={`${m.ts}-${idx}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.32 }}>
-                    <div className="ivan-message-content"><div className="message-meta"><span>ИВАН</span><time>{tsToTime(m.ts)}</time></div><div className="ivan-bubble"><p>{m.content}</p></div></div><span className="message-user-avatar">И</span>
-                  </motion.article>
-                ) : (
-                  <motion.article className="message message-eva" key={`${m.ts}-${idx}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.32 }}>
-                    <EvaAvatar mode={mode} className="message-eva-avatar" />
-                    <div className="eva-message-content"><div className="message-meta eva-message-meta"><span>ЕВА <i /></span><time>{tsToTime(m.ts)}</time></div><div className="eva-copy">{m.content.split("\n\n").map((p, i) => <p key={i}>{p}</p>)}</div></div>
-                  </motion.article>
-                ))}
+                {messages.map((m, idx) => {
+                  if (m.role === "assistant") {
+                    return (
+                      <motion.article className="message message-eva" key={`${m.ts}-${idx}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.32 }}>
+                        <EvaAvatar mode={mode} className="message-eva-avatar" />
+                        <div className="eva-message-content"><div className="message-meta eva-message-meta"><span>ЕВА <i /></span><time>{tsToTime(m.ts)}</time></div><div className="eva-copy"><RichText text={m.content} /></div></div>
+                      </motion.article>
+                    );
+                  }
+                  // system-injected "user" rows (background notices) render as a quiet system line, not as Ivan
+                  if (isSystemNote(m.content)) {
+                    return (
+                      <div className="system-note" key={`${m.ts}-${idx}`} title={m.content}>
+                        <span className="system-note-dot" /> системное событие · {tsToTime(m.ts)}
+                      </div>
+                    );
+                  }
+                  const shown = cleanUserContent(m.content);
+                  if (!shown) return null;
+                  return (
+                    <motion.article className="message message-ivan" key={`${m.ts}-${idx}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.32 }}>
+                      <div className="ivan-message-content"><div className="message-meta"><span>ИВАН</span><time>{tsToTime(m.ts)}</time></div><div className="ivan-bubble"><RichText text={shown} /></div></div><span className="message-user-avatar">И</span>
+                    </motion.article>
+                  );
+                })}
                 {sending && (streamBuf ? (
                   <motion.article className="message message-eva" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
                     <EvaAvatar mode={mode} className="message-eva-avatar" />
-                    <div className="eva-message-content"><div className="message-meta eva-message-meta"><span>ЕВА <i /></span><time>{formatTime()}</time></div><div className="eva-copy">{streamBuf.split("\n\n").map((p, i) => <p key={i}>{p}<span className="stream-caret" /></p>)}</div></div>
+                    <div className="eva-message-content"><div className="message-meta eva-message-meta"><span>ЕВА <i /></span><time>{formatTime()}</time></div><div className="eva-copy"><RichText text={streamBuf} /><span className="stream-caret" /></div></div>
                   </motion.article>
                 ) : (
                   <div className="thinking-line"><span className="thinking-mark"><TypingDots /></span><div><strong>Ева думает</strong><small>SOUL.md + recall(memory.db) + фоновые мысли + телеметрия → LLM</small></div><span className="thinking-wave" aria-hidden="true"><i /><i /><i /><i /><i /></span></div>
