@@ -18,7 +18,6 @@ use std::process::Child;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use base64::Engine;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{
@@ -37,6 +36,10 @@ struct Runtime {
     /// The Hermes child WE launched (so we only ever kill our own, and we can
     /// reap it on exit). None = we attached to Ivan's already-running core.
     child: Mutex<Option<Child>>,
+    /// Set true to ask the in-flight chat stream to abort. A fresh stream clears
+    /// it; /stop sets it; the SSE loop checks it and drops the HTTP response
+    /// (which cancels the request to the core), so /stop is a REAL stop.
+    cancel_chat: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize, Clone)]
@@ -64,19 +67,19 @@ async fn api_send(method: String, path: String, body: Option<Value>) -> Result<V
     bridge::request(&method, &path, body).await
 }
 
-/// Multipart upload for /api/attach. React hands base64 (WebView can't stream a
-/// File across IPC cheaply); Rust decodes and posts a real multipart form.
+/// Multipart upload for /api/attach. React hands raw bytes as a number[] over
+/// IPC (no base64 double-copy). Rust posts a real multipart form. 25 MB ceiling.
 #[tauri::command]
 async fn api_upload(
     path: String,
     filename: String,
     content_type: Option<String>,
-    data_base64: String,
+    bytes: Vec<u8>,
 ) -> Result<Value, String> {
     guard_path(&path)?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_base64.as_bytes())
-        .map_err(|e| format!("bad base64: {e}"))?;
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err("файл больше 25 МБ".into());
+    }
     bridge::upload(&path, &filename, content_type.as_deref().unwrap_or(""), bytes).await
 }
 
@@ -92,8 +95,11 @@ fn guard_path(path: &str) -> Result<(), String> {
 
 /// Real streamed chat: open the core's SSE endpoint and forward each token to
 /// React over a Tauri Channel (ordered delivery), never a fake word-splitter.
+/// Cancellable: /stop flips Runtime.cancel_chat and the loop drops the response,
+/// which cancels the HTTP request to the core — a real stop, not a UI mute.
 #[tauri::command]
 async fn eva_chat_stream(
+    app: AppHandle,
     message: String,
     mode: String,
     conversation_id: Option<String>,
@@ -103,6 +109,12 @@ async fn eva_chat_stream(
     on_event: Channel<Value>,
 ) -> Result<(), String> {
     use futures_util::StreamExt;
+    use std::sync::atomic::Ordering;
+
+    // fresh stream — clear any stale cancel flag
+    if let Some(rt) = app.try_state::<Runtime>() {
+        rt.cancel_chat.store(false, Ordering::SeqCst);
+    }
 
     let body = json!({
         "message": message,
@@ -127,6 +139,16 @@ async fn eva_chat_stream(
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
+        // cancellation check — dropping `stream`/`resp` aborts the request
+        if let Some(rt) = app.try_state::<Runtime>() {
+            if rt.cancel_chat.load(Ordering::SeqCst) {
+                rt.cancel_chat.store(false, Ordering::SeqCst);
+                drop(stream);
+                let _ = on_event.send(json!({ "kind": "done", "reply": Value::Null, "aborted": true }));
+                let _ = on_event.send(json!({ "kind": "presence", "state": "present" }));
+                return Ok(());
+            }
+        }
         let chunk = chunk.map_err(|e| e.to_string())?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
         // SSE frames are separated by a blank line
@@ -160,16 +182,30 @@ async fn eva_chat_stream(
     Ok(())
 }
 
+/// Ask the in-flight chat stream to abort (real cancellation).
+#[tauri::command]
+fn eva_chat_stop(app: AppHandle) {
+    if let Some(rt) = app.try_state::<Runtime>() {
+        rt.cancel_chat.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 // ── runtime lifecycle ────────────────────────────────────────────────────────
+// The bridge URL is loopback-only: a setting (or a poisoned eva.db) can pick the
+// port but never a remote host. Non-local values are ignored and we fall back to
+// the default, so the core is always reached on 127.0.0.1.
 fn bridge_url_from_db(app: &AppHandle) -> String {
     if let Some(state) = app.try_state::<Db>() {
         if let Ok(conn) = state.0.lock() {
             if let Some(u) = db::get_setting(&conn, "bridge_url") {
-                std::env::set_var("EVA_BRIDGE_URL", &u);
-                return u;
+                if bridge::is_local_url(&u) {
+                    std::env::set_var("EVA_BRIDGE_URL", &u);
+                    return u;
+                }
             }
         }
     }
+    std::env::set_var("EVA_BRIDGE_URL", "http://127.0.0.1:8770");
     "http://127.0.0.1:8770".to_string()
 }
 
@@ -179,6 +215,8 @@ fn bridge_url_from_db(app: &AppHandle) -> String {
 ///   2. %LOCALAPPDATA%\hermes
 ///   3. ~/.hermes
 /// server.py: EVA_SERVER_PY env → C:\Tools\eva-desktop\server.py → <home>\eva-desktop\server.py
+/// Picks the first home that yields a VALID runtime (venv python + server.py both
+/// exist), not merely the first home directory that exists.
 fn discover_runtime() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let mut homes: Vec<PathBuf> = vec![];
     for k in ["EVA_HERMES_HOME", "HERMES_HOME"] {
@@ -195,26 +233,34 @@ fn discover_runtime() -> Option<(PathBuf, PathBuf, PathBuf)> {
         homes.push(home.join(".hermes"));
     }
 
-    let home = homes.into_iter().find(|h| h.exists())?;
-    // venv pythonw (Windows) or python
-    let pythonw = {
-        let w = home.join("hermes-agent").join("venv").join("Scripts").join("pythonw.exe");
-        let p = home.join("hermes-agent").join("venv").join("Scripts").join("python.exe");
-        let nix = home.join("hermes-agent").join("venv").join("bin").join("python");
-        if w.exists() { w } else if p.exists() { p } else if nix.exists() { nix } else { return None }
-    };
-    // server.py
-    let server = if let Ok(s) = std::env::var("EVA_SERVER_PY") {
-        PathBuf::from(s)
-    } else {
-        let tools = PathBuf::from(r"C:\Tools\eva-desktop\server.py");
-        if tools.exists() { tools } else { home.join("eva-desktop").join("server.py") }
-    };
-    if !server.exists() {
-        return None;
+    // an explicit server.py override still needs *a* python; try each home's venv
+    let server_override = std::env::var("EVA_SERVER_PY").ok().map(PathBuf::from);
+
+    for home in homes {
+        if !home.exists() {
+            continue;
+        }
+        let py = {
+            let w = home.join("hermes-agent").join("venv").join("Scripts").join("pythonw.exe");
+            let p = home.join("hermes-agent").join("venv").join("Scripts").join("python.exe");
+            let nix = home.join("hermes-agent").join("venv").join("bin").join("python");
+            if w.exists() { Some(w) } else if p.exists() { Some(p) } else if nix.exists() { Some(nix) } else { None }
+        };
+        let py = match py { Some(p) => p, None => continue };
+
+        let server = if let Some(ref s) = server_override {
+            s.clone()
+        } else {
+            let tools = PathBuf::from(r"C:\Tools\eva-desktop\server.py");
+            if tools.exists() { tools } else { home.join("eva-desktop").join("server.py") }
+        };
+        if !server.exists() {
+            continue;
+        }
+        let cwd = server.parent().map(|p| p.to_path_buf()).unwrap_or(home.clone());
+        return Some((py, server, cwd));
     }
-    let cwd = server.parent().map(|p| p.to_path_buf()).unwrap_or(home.clone());
-    Some((pythonw, server, cwd))
+    None
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -226,7 +272,16 @@ async fn build_status(app: &AppHandle) -> RuntimeStatus {
     let reachable = bridge::ping().await;
     let launched_by_us = app
         .try_state::<Runtime>()
-        .map(|rt| rt.child.lock().unwrap().is_some())
+        .map(|rt| {
+            let mut guard = rt.child.lock().unwrap();
+            // reap a child that already died so we don't consider a corpse "live"
+            if let Some(child) = guard.as_mut() {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    *guard = None;
+                }
+            }
+            guard.is_some()
+        })
         .unwrap_or(false);
     RuntimeStatus {
         reachable,
@@ -242,18 +297,31 @@ async fn runtime_status(app: AppHandle) -> Result<RuntimeStatus, String> {
 
 /// Start the FastAPI core if nothing answers. Idempotent and single-owner:
 /// only ONE caller (the setup hook) ever invokes this, and it no-ops when the
-/// port already answers or when we already spawned a child.
+/// port already answers or when we already have a LIVE child.
 #[tauri::command]
 async fn runtime_start(app: AppHandle) -> Result<RuntimeStatus, String> {
-    // apply configured bridge url BEFORE probing, so we check the right port
+    // apply configured (loopback-only) bridge url BEFORE probing, so we check
+    // the right port and spawn the core on the SAME host:port we'll talk to.
     let _ = bridge_url_from_db(&app);
+    let (host, port) = bridge::host_port();
 
     if bridge::ping().await {
         return Ok(build_status(&app).await);
     }
-    // already have a child? don't double-spawn
-    if let Some(rt) = app.try_state::<Runtime>() {
-        if rt.child.lock().unwrap().is_some() {
+    // already have a LIVE child? don't double-spawn (build_status reaps dead ones)
+    {
+        let mut has_live = false;
+        if let Some(rt) = app.try_state::<Runtime>() {
+            let mut guard = rt.child.lock().unwrap();
+            if let Some(child) = guard.as_mut() {
+                if matches!(child.try_wait(), Ok(None)) {
+                    has_live = true;
+                } else {
+                    *guard = None; // dead — respawn below
+                }
+            }
+        }
+        if has_live {
             return Ok(build_status(&app).await);
         }
     }
@@ -261,8 +329,8 @@ async fn runtime_start(app: AppHandle) -> Result<RuntimeStatus, String> {
     if let Some((pythonw, server, cwd)) = discover_runtime() {
         let child = std::process::Command::new(&pythonw)
             .arg(&server)
-            .arg("--host").arg("127.0.0.1")
-            .arg("--port").arg("8770")
+            .arg("--host").arg(&host)
+            .arg("--port").arg(port.to_string())
             .current_dir(&cwd)
             .spawn();
         match child {
@@ -273,7 +341,7 @@ async fn runtime_start(app: AppHandle) -> Result<RuntimeStatus, String> {
                 }
                 if let Some(state) = app.try_state::<Db>() {
                     if let Ok(conn) = state.0.lock() {
-                        db::log_event(&conn, "runtime_start", &pid.to_string()).ok();
+                        db::log_event(&conn, "runtime_start", &format!("{host}:{port} pid={pid}")).ok();
                     }
                 }
             }
@@ -500,10 +568,12 @@ pub fn run() {
             });
             Ok(())
         })
-        // reap our Hermes child when the last window is destroyed
+        // X on the window HIDES it (tray keeps Eva + her core alive); the real
+        // teardown happens only via tray → Выйти (which calls reap + app.exit).
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                reap_runtime(window.app_handle());
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -511,6 +581,7 @@ pub fn run() {
             api_send,
             api_upload,
             eva_chat_stream,
+            eva_chat_stop,
             runtime_status,
             runtime_start,
             get_setting,

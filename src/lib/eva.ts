@@ -111,18 +111,17 @@ export const api = {
   toolsetToggle: (name: string, enabled: boolean) =>
     apiSend<{ ok: boolean; name: string; enabled: boolean; note?: string }>("POST", `/api/toolsets/${encodeURIComponent(name)}/toggle`, { enabled }),
 
-  // File attach: read the File in the WebView, hand base64 to Rust which posts
-  // a real multipart form to /api/attach (text → inline, image → Gemini vision).
+  // File attach: read the File in the WebView, hand raw bytes to Rust as a
+  // number[] over IPC (no base64 double-copy). Rust posts a real multipart form
+  // to /api/attach (text → inline, image → Gemini vision). 25 MB ceiling.
   attach: async (f: File) => {
-    const buf = new Uint8Array(await f.arrayBuffer());
-    let bin = "";
-    const CHUNK = 0x8000;
-    for (let i = 0; i < buf.length; i += CHUNK) {
-      bin += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + CHUNK)) as unknown as number[]);
+    const MAX = 25 * 1024 * 1024;
+    if (f.size > MAX) {
+      return { ok: false, kind: "toobig", name: f.name, size: f.size, block: "", error: `файл > 25 МБ (${Math.round(f.size / 1048576)} МБ)` };
     }
-    const data_base64 = btoa(bin);
+    const bytes = Array.from(new Uint8Array(await f.arrayBuffer()));
     return invoke<{ ok: boolean; kind: string; name: string; size: number; block: string; error?: string }>(
-      "api_upload", { path: "/api/attach", filename: f.name, contentType: f.type || "", dataBase64: data_base64 },
+      "api_upload", { path: "/api/attach", filename: f.name, contentType: f.type || "", bytes },
     );
   },
 
@@ -151,6 +150,11 @@ export async function chatStream(
   } catch (e) {
     onError(String(e));
   }
+}
+
+// Real stop: asks Rust to abort the in-flight SSE (drops the HTTP request to the core).
+export function chatStop() {
+  invoke("eva_chat_stop").catch(() => {});
 }
 
 // ── OS + local desktop state (Rust-owned) ────────────────────────────────────

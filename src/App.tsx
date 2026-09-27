@@ -7,7 +7,7 @@ import {
   Plus, RefreshCw, Search, Settings2, Sparkles, Trash2, Wrench, X, type LucideIcon,
 } from "lucide-react";
 import {
-  api, chatStream, os as osIntegration,
+  api, chatStream, chatStop, os as osIntegration,
   type Mode, type PresenceState, type LiveState, type HistoryRow, type ConversationRow, type ModelCatalog, type Effort,
 } from "./lib/eva";
 import PresenceOrb from "./components/PresenceOrb";
@@ -116,6 +116,7 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashIdx, setSlashIdx] = useState(0);
+  const [prefsReady, setPrefsReady] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pendingShapeRef = useRef<string | null>(null);
 
@@ -125,8 +126,8 @@ export default function App() {
   const toastRef = useRef<number | null>(null);
   const compactRef = useRef(window.innerWidth < 1200);
 
-  useEffect(() => { localStorage.setItem("eva-mode", mode); osIntegration.setSetting("mode", mode); }, [mode]);
-  useEffect(() => { localStorage.setItem("eva-effort", effort); osIntegration.setSetting("effort", effort); }, [effort]);
+  useEffect(() => { if (prefsReady) { localStorage.setItem("eva-mode", mode); osIntegration.setSetting("mode", mode); } }, [mode, prefsReady]);
+  useEffect(() => { if (prefsReady) { localStorage.setItem("eva-effort", effort); osIntegration.setSetting("effort", effort); } }, [effort, prefsReady]);
   useEffect(() => { const i = window.setInterval(() => setClock(formatTime()), 15_000); return () => window.clearInterval(i); }, []);
 
   const refreshState = useCallback(async () => {
@@ -161,6 +162,7 @@ export default function App() {
           if (s.model) { try { const c = JSON.parse(s.model); if (c?.provider && c?.model) setChosen(c); } catch { /**/ } }
         }
       } catch { /* plain browser dev — stick with localStorage seed */ }
+      finally { setPrefsReady(true); } // only now may pref-writers persist (no localStorage→DB race)
       await Promise.all([refreshState(), refreshConversations()]);
       await loadConversation("eva_desktop");
       try { setModelCat(await api.models()); } catch { /**/ }
@@ -293,7 +295,7 @@ export default function App() {
     { cmd: "/retry", desc: "переспросить последним сообщением", group: "сессия", kind: "act", run: () => {
         const lastUser = [...messages].reverse().find((m) => m.role !== "assistant");
         if (lastUser) setComposer(lastUser.content); else notify("Нечего повторять"); } },
-    { cmd: "/stop", desc: "прервать ответ Евы", group: "сессия", kind: "act", run: () => { if (sending) { setSending(false); setPresence("present"); setStreamBuf(""); notify("Прервано"); } } },
+    { cmd: "/stop", desc: "прервать ответ Евы", group: "сессия", kind: "act", run: () => { if (sending) { chatStop(); notify("Останавливаю…"); } } },
     { cmd: "/copy", desc: "скопировать разговор", group: "сессия", kind: "act", run: () => copyConversation() },
     // navigation to panes
     { cmd: "/memory", arg: "запрос", desc: "искать в памяти", group: "панели", kind: "act", run: (a) => { if (a) setSearchQuery(a); choosePage("memory"); } },
