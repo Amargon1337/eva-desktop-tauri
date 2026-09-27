@@ -645,3 +645,44 @@ pub fn run() {
             }
         });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::next_frame_sep;
+
+    #[test]
+    fn sse_separators_lf_and_crlf() {
+        // "data: {\"a\":1}" is 13 bytes
+        assert_eq!(next_frame_sep("data: {\"a\":1}\n\nrest"), Some((13, 2)));
+        assert_eq!(next_frame_sep("data: {\"a\":1}\r\n\r\nrest"), Some((13, 4)));
+        // CRLF separator wins when both could match
+        assert_eq!(next_frame_sep("a\r\n\r\nb\n\nc"), Some((1, 4)));
+        assert_eq!(next_frame_sep("a\n\nb\r\n\r\nc"), Some((1, 2)));
+        // CR alone is NOT a separator (would desync a CRLF stream)
+        assert_eq!(next_frame_sep("a\r\rb"), None);
+        assert_eq!(next_frame_sep("a\r\nb"), None);
+    }
+
+    #[test]
+    fn sse_separators_incomplete_and_empty() {
+        assert_eq!(next_frame_sep(""), None);
+        assert_eq!(next_frame_sep("data: partial frame"), None);
+        // a lone \n or \r\n is not enough — need the blank line
+        assert_eq!(next_frame_sep("data: x\n"), None);
+        assert_eq!(next_frame_sep("data: x\r\n"), None);
+        // separator split across chunks stays pending until complete
+        assert_eq!(next_frame_sep("data: x\r"), None);
+        assert_eq!(next_frame_sep("data: x\r\n"), None);
+        assert_eq!(next_frame_sep("data: x\r\n\r"), None);
+    }
+
+    #[test]
+    fn sse_separators_multiple_frames() {
+        // earliest frame wins even with several queued
+        let buf = "data: a\n\ndata: b\n\ntail";
+        assert_eq!(next_frame_sep(buf), Some((7, 2)));
+        // frame boundary at the very end of the buffer
+        assert_eq!(next_frame_sep("data: a\n\n"), Some((7, 2)));
+        assert_eq!(next_frame_sep("data: a\r\n\r\n"), Some((7, 4)));
+    }
+}

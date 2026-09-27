@@ -15,8 +15,10 @@ jobs:
         with:
           node-version: "22"
       - run: npm ci
-      - name: Typecheck
+      - name: Typecheck frontend
         run: npm run typecheck
+      - name: Typecheck node/vite config
+        run: npm run typecheck:node
       - name: Build frontend
         run: npm run build
 
