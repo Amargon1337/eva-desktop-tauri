@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Activity, ArrowRight, BookOpenText, Brain, ChevronRight, Command, Database, FileText,
@@ -102,8 +103,8 @@ export default function App() {
   const toastRef = useRef<number | null>(null);
   const compactRef = useRef(window.innerWidth < 1200);
 
-  useEffect(() => { localStorage.setItem("eva-mode", mode); }, [mode]);
-  useEffect(() => { localStorage.setItem("eva-effort", effort); }, [effort]);
+  useEffect(() => { localStorage.setItem("eva-mode", mode); osIntegration.setSetting("mode", mode); }, [mode]);
+  useEffect(() => { localStorage.setItem("eva-effort", effort); osIntegration.setSetting("effort", effort); }, [effort]);
   useEffect(() => { const i = window.setInterval(() => setClock(formatTime()), 15_000); return () => window.clearInterval(i); }, []);
 
   const refreshState = useCallback(async () => {
@@ -128,13 +129,29 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      await osIntegration.runtimeStart();
+      // Rust owns runtime bootstrap (single owner, no race). We just wait for reachability.
+      // eva.db is the source of truth for desktop prefs — hydrate from it (falls back to localStorage seed).
+      try {
+        const s = await osIntegration.getSettings();
+        if (s) {
+          if (s.mode === "sakura" || s.mode === "yandere") setMode(s.mode);
+          if (["off", "minimal", "low", "medium", "high"].includes(s.effort)) setEffort(s.effort as Effort);
+          if (s.model) { try { const c = JSON.parse(s.model); if (c?.provider && c?.model) setChosen(c); } catch { /**/ } }
+        }
+      } catch { /* plain browser dev — stick with localStorage seed */ }
       await Promise.all([refreshState(), refreshConversations()]);
       await loadConversation("eva_desktop");
       try { setModelCat(await api.models()); } catch { /**/ }
     })();
-    const s = window.setInterval(refreshState, 15_000);
-    return () => window.clearInterval(s);
+    // Rust presence poller pushes live telemetry; subscribe instead of polling hard.
+    const unlisten = listen<{ state: string; snapshot?: LiveState }>("eva://state", (e) => {
+      const p = e.payload;
+      if (p?.snapshot) setLive(p.snapshot);
+      setPresence((prev) => (prev === "thinking" || prev === "speaking") ? prev : (p.state as PresenceState) || prev);
+    });
+    // gentle fallback poll in case events are missed (e.g. plain browser dev)
+    const s = window.setInterval(refreshState, 30_000);
+    return () => { window.clearInterval(s); unlisten.then((f) => f()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -341,11 +358,13 @@ export default function App() {
     const c = { provider, model };
     setChosen(c);
     localStorage.setItem("eva-model", JSON.stringify(c));
+    osIntegration.setSetting("model", JSON.stringify(c));
     notify(`Модель: ${provider} / ${model}`);
   }
   function clearModel() {
     setChosen(null);
     localStorage.removeItem("eva-model");
+    osIntegration.setSetting("model", "");
     notify("Модель по умолчанию (цепочка ядра)");
   }
 

@@ -83,6 +83,22 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// All settings as a flat JSON object — the single source of truth for
+/// desktop-persistent prefs (mode, model, effort, bridge_url). React reads
+/// these at boot instead of localStorage.
+pub fn all_settings(conn: &Connection) -> Result<serde_json::Value> {
+    let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
+    let mut map = serde_json::Map::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (k, v) = row?;
+        map.insert(k, serde_json::Value::String(v));
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
 pub fn log_event(conn: &Connection, kind: &str, payload: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO events(kind,payload) VALUES (?1,?2)",

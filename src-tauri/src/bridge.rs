@@ -1,56 +1,99 @@
-// Eva Bridge — the small IPC/API layer between the desktop and the Hermes/Eva
-// runtime. We deliberately do NOT reach into Hermes internals; we speak to the
-// FastAPI core already running on :8770 (the one that owns memory.db), so there
-// is one memory writer and the desktop never forks Eva's memory.
+// Eva Bridge — the ONLY network boundary between the desktop and the Hermes/Eva
+// runtime. React never touches the network: every request crosses a #[tauri::command]
+// and lands here, so Rust owns the HTTP to the FastAPI core (:8770) that owns memory.db.
 //
-// Exposes: chat (buffered + streamed), state, memory, thoughts, pins, services,
-// history, reflect. Streaming turns the reply into token/token/token events on
-// a Tauri channel so the UI can visually "live" (idle → thinking → speaking).
+// One shared reqwest client (pooled, timeouts), a generic request passthrough,
+// a multipart upload, and a real SSE reader for streamed chat.
 
-use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+use std::time::Duration;
+
 use serde_json::Value;
 
-fn base() -> String {
+static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Base URL of the Hermes/Eva core. Configurable via EVA_BRIDGE_URL (set from
+/// the eva.db `bridge_url` setting at startup); defaults to localhost:8770.
+pub fn base() -> String {
     std::env::var("EVA_BRIDGE_URL").unwrap_or_else(|_| "http://127.0.0.1:8770".to_string())
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy() // localhost only; never route Eva through a proxy
-        .build()
-        .unwrap_or_default()
+/// One pooled client for the whole app. connect timeout guards a dead port;
+/// no total timeout here (per-request timeouts are applied by callers, and the
+/// stream reader must not be capped).
+pub fn client() -> &'static reqwest::Client {
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy() // localhost only; never route Eva through a proxy
+            .connect_timeout(Duration::from_secs(8))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("build reqwest client")
+    })
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct ChatArgs {
-    pub message: String,
-    pub mode: String,
-}
-
-pub async fn get_json(path: &str) -> Result<Value, String> {
+/// Generic JSON request: GET/POST/PUT/DELETE. `body` is sent for POST/PUT.
+/// A 30s request timeout guards hung calls (chat/logs/etc.) without touching
+/// the separate streaming path.
+pub async fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
     let url = format!("{}{}", base(), path);
-    let resp = client().get(&url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("{} → HTTP {}", path, resp.status()));
+    let m = method.to_uppercase();
+    let mut rb = match m.as_str() {
+        "GET" => client().get(&url),
+        "POST" => client().post(&url),
+        "PUT" => client().put(&url),
+        "DELETE" => client().delete(&url),
+        other => return Err(format!("unsupported method {other}")),
+    };
+    rb = rb.timeout(Duration::from_secs(30));
+    if let Some(b) = body {
+        rb = rb.json(&b);
     }
-    resp.json::<Value>().await.map_err(|e| e.to_string())
+    let resp = rb.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        let tail = resp.text().await.unwrap_or_default();
+        return Err(format!("{path} → HTTP {status} {}", tail.chars().take(200).collect::<String>()));
+    }
+    // Some endpoints (204, empty) may return no body — tolerate it.
+    let txt = resp.text().await.map_err(|e| e.to_string())?;
+    if txt.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str::<Value>(&txt).map_err(|e| e.to_string())
 }
 
-pub async fn post_json(path: &str, body: Value) -> Result<Value, String> {
+/// Multipart file upload (for /api/attach). Bytes arrive base64 from React.
+pub async fn upload(path: &str, filename: &str, content_type: &str, bytes: Vec<u8>) -> Result<Value, String> {
     let url = format!("{}{}", base(), path);
+    let mut part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_string());
+    if !content_type.is_empty() {
+        part = part.mime_str(content_type).map_err(|e| e.to_string())?;
+    }
+    let form = reqwest::multipart::Form::new().part("file", part);
     let resp = client()
         .post(&url)
-        .json(&body)
+        .timeout(Duration::from_secs(120)) // vision on a big image can be slow
+        .multipart(form)
         .send()
         .await
         .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("{} → HTTP {}", path, resp.status()));
+        return Err(format!("{path} → HTTP {}", resp.status()));
     }
     resp.json::<Value>().await.map_err(|e| e.to_string())
 }
 
-/// Is the runtime reachable at all?
+/// Is the runtime reachable at all? (short-timeout GET /api/state)
 pub async fn ping() -> bool {
-    get_json("/api/state").await.is_ok()
+    let url = format!("{}/api/state", base());
+    match client()
+        .get(&url)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
 }

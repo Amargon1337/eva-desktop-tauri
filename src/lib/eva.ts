@@ -1,13 +1,18 @@
 // Eva Desktop (Tauri) — data layer.
-// DESIGN NOTE: the rich data API lives in the FastAPI core on localhost:8770
-// (one memory writer, the real memory.db). React hits it directly over HTTP —
-// CSP is disabled and the backend sets CORS *. Duplicating the whole memory
-// CRUD / prompt-file / conversation API through Rust IPC would balloon the
-// binary and force a 6-min recompile per tweak. Rust keeps what only Rust can
-// do: system tray, global hotkey, native notifications, runtime bootstrap —
-// reached via invokeSafe(), which no-ops gracefully in a plain dev browser.
+//
+// ARCHITECTURE (single boundary): React NEVER touches the network. Every call
+// goes through Tauri IPC → Rust → the FastAPI Eva core (:8770, the one memory
+// writer). Rust owns the HTTP, timeouts, streaming and the child runtime. This
+// file is a thin typed wrapper over three Rust commands:
+//   api_get(path)                 → GET  /api/*
+//   api_send(method, path, body)  → POST/PUT/DELETE /api/*
+//   api_upload(path, file…)       → multipart /api/attach
+// plus eva_chat_stream over a Tauri Channel for real SSE.
+//
+// invoke() is imported from @tauri-apps/api/core (the bundler-correct path;
+// withGlobalTauri is also on, but the import is what makes it reliable).
 
-const BASE = "http://127.0.0.1:8770";
+import { invoke, Channel } from "@tauri-apps/api/core";
 
 export type Mode = "sakura" | "yandere";
 export type PresenceState = "present" | "idle" | "away" | "thinking" | "speaking";
@@ -45,114 +50,113 @@ export type Effort = "off" | "minimal" | "low" | "medium" | "high";
 export type SkillRow = { name: string; description: string; category: string; version: string; path?: string; chars?: number };
 export type ToolsetRow = { name: string; enabled: boolean; description?: string };
 
-async function j<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(BASE + url, init);
-  if (!r.ok) throw new Error(`${r.status} ${url}`);
-  return r.json() as Promise<T>;
+// ── the one boundary ─────────────────────────────────────────────────────────
+async function apiGet<T>(path: string): Promise<T> {
+  return invoke<T>("api_get", { path });
 }
-function body(method: string, b: unknown): RequestInit {
-  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) };
+async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
+  return invoke<T>("api_send", { method, path, body: body ?? null });
+}
+
+function qs(params: Record<string, string | number | boolean | undefined>): string {
+  const parts = Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`);
+  return parts.length ? `?${parts.join("&")}` : "";
 }
 
 export const api = {
-  state: () => j<LiveState>("/api/state"),
-  reachable: async () => { try { await j("/api/state"); return true; } catch { return false; } },
+  state: () => apiGet<LiveState>("/api/state"),
+  reachable: async () => { try { await apiGet("/api/state"); return true; } catch { return false; } },
 
-  conversations: (limit = 60) => j<ConversationRow[]>(`/api/conversations?limit=${limit}`),
+  conversations: (limit = 60) => apiGet<ConversationRow[]>(`/api/conversations${qs({ limit })}`),
   conversationMessages: (id: string, limit = 300) =>
-    j<{ id: number; role: string; content: string; ts: string }[]>(`/api/conversations/${encodeURIComponent(id)}/messages?limit=${limit}`),
-  deleteConversation: (id: string) => j<{ ok: boolean; deleted: number }>(`/api/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    apiGet<{ id: number; role: string; content: string; ts: string }[]>(`/api/conversations/${encodeURIComponent(id)}/messages${qs({ limit })}`),
+  deleteConversation: (id: string) => apiSend<{ ok: boolean; deleted: number }>("DELETE", `/api/conversations/${encodeURIComponent(id)}`),
   history: (limit = 80, conversation_id = "eva_desktop") =>
-    j<HistoryRow[]>(`/api/history?limit=${limit}&conversation_id=${encodeURIComponent(conversation_id)}`),
+    apiGet<HistoryRow[]>(`/api/history${qs({ limit, conversation_id })}`),
 
   memory: (search?: string, limit = 80, includeArchived = false) =>
-    j<MemoryRow[]>(`/api/memory?${search ? `search=${encodeURIComponent(search)}` : `limit=${limit}`}${includeArchived ? "&include_archived=true" : ""}`),
-  memoryGet: (id: number) => j<{ memory: MemoryRow; history: MemoryHistory[] }>(`/api/memory/${id}`),
+    apiGet<MemoryRow[]>(`/api/memory${qs(search ? { search, include_archived: includeArchived || undefined } : { limit, include_archived: includeArchived || undefined })}`),
+  memoryGet: (id: number) => apiGet<{ memory: MemoryRow; history: MemoryHistory[] }>(`/api/memory/${id}`),
   memoryCreate: (b: { content: string; memory_type?: string; importance?: string; category?: string; confidence?: number; tags?: string[] }) =>
-    j<{ ok: boolean; id: number; memory: MemoryRow }>("/api/memory", body("POST", b)),
+    apiSend<{ ok: boolean; id: number; memory: MemoryRow }>("POST", "/api/memory", b),
   memoryUpdate: (id: number, b: Partial<{ content: string; memory_type: string; importance: string; category: string; confidence: number; status: string; tags: string[] }>) =>
-    j<{ ok: boolean; memory: MemoryRow }>(`/api/memory/${id}`, body("PUT", b)),
-  memoryDelete: (id: number, hard = false) => j<{ ok: boolean }>(`/api/memory/${id}?hard=${hard}`, { method: "DELETE" }),
-  pins: (limit = 12) => j<PinRow[]>(`/api/pins?limit=${limit}`),
+    apiSend<{ ok: boolean; memory: MemoryRow }>("PUT", `/api/memory/${id}`, b),
+  memoryDelete: (id: number, hard = false) => apiSend<{ ok: boolean }>("DELETE", `/api/memory/${id}${qs({ hard })}`),
+  pins: (limit = 12) => apiGet<PinRow[]>(`/api/pins${qs({ limit })}`),
 
-  promptfiles: () => j<PromptFileMeta[]>("/api/promptfiles"),
-  promptfileGet: (key: string) => j<{ key: string; name: string; content: string }>(`/api/promptfiles/${key}`),
-  promptfileWrite: (key: string, content: string) => j<{ ok: boolean; chars: number }>(`/api/promptfiles/${key}`, body("PUT", { content })),
+  promptfiles: () => apiGet<PromptFileMeta[]>("/api/promptfiles"),
+  promptfileGet: (key: string) => apiGet<{ key: string; name: string; content: string }>(`/api/promptfiles/${key}`),
+  promptfileWrite: (key: string, content: string) => apiSend<{ ok: boolean; chars: number }>("PUT", `/api/promptfiles/${key}`, { content }),
 
-  entities: (limit = 100) => j<EntityRow[]>(`/api/entities?limit=${limit}`),
-  contradictions: () => j<any[]>("/api/contradictions"),
-  jokes: () => j<any[]>("/api/jokes"),
-  thoughts: (limit = 80, mood?: string) => j<ThoughtRow[]>(`/api/thoughts?limit=${limit}${mood && mood !== "all" ? `&mood=${encodeURIComponent(mood)}` : ""}`),
-  reflect: () => j<{ ok: boolean }>("/api/reflect", { method: "POST" }),
+  entities: (limit = 100) => apiGet<EntityRow[]>(`/api/entities${qs({ limit })}`),
+  contradictions: () => apiGet<any[]>("/api/contradictions"),
+  jokes: () => apiGet<any[]>("/api/jokes"),
+  thoughts: (limit = 80, mood?: string) => apiGet<ThoughtRow[]>(`/api/thoughts${qs({ limit, mood: mood && mood !== "all" ? mood : undefined })}`),
+  reflect: () => apiSend<{ ok: boolean }>("POST", "/api/reflect", {}),
 
-  services: () => j<ServiceRow[]>("/api/services"),
+  services: () => apiGet<ServiceRow[]>("/api/services"),
   serviceAction: (id: string, action: "start" | "stop" | "restart") =>
-    j<{ ok: boolean; message?: string; error?: string; killed_processes?: number; pid?: number }>(
-      `/api/services/${encodeURIComponent(id)}/action`, body("POST", { action })),
+    apiSend<{ ok: boolean; message?: string; error?: string; killed_processes?: number; pid?: number }>("POST", `/api/services/${encodeURIComponent(id)}/action`, { action }),
   serviceLogs: (id: string, lines = 120) =>
-    j<{ success: boolean; lines?: string[]; path?: string; total_lines?: number; error?: string }>(
-      `/api/services/${encodeURIComponent(id)}/logs?lines=${lines}`),
-  tokens: () => j<{ days: { date: string; tokens: number }[] }>("/api/tokens"),
-  models: () => j<ModelCatalog>("/api/models"),
-  skills: () => j<SkillRow[]>("/api/skills"),
-  skillGet: (path: string) => j<{ path: string; content: string }>(`/api/skills/${path.split("/").map(encodeURIComponent).join("/")}`),
+    apiGet<{ success: boolean; lines?: string[]; path?: string; total_lines?: number; error?: string }>(`/api/services/${encodeURIComponent(id)}/logs${qs({ lines })}`),
+  tokens: () => apiGet<{ days: { date: string; tokens: number }[] }>("/api/tokens"),
+  models: () => apiGet<ModelCatalog>("/api/models"),
+  skills: () => apiGet<SkillRow[]>("/api/skills"),
+  skillGet: (path: string) => apiGet<{ path: string; content: string }>(`/api/skills/${path.split("/").map(encodeURIComponent).join("/")}`),
   skillWrite: (path: string, content: string) =>
-    j<{ ok: boolean; chars: number }>(`/api/skills/${path.split("/").map(encodeURIComponent).join("/")}`, body("PUT", { content })),
-  toolsets: () => j<ToolsetRow[]>("/api/toolsets"),
+    apiSend<{ ok: boolean; chars: number }>("PUT", `/api/skills/${path.split("/").map(encodeURIComponent).join("/")}`, { content }),
+  toolsets: () => apiGet<ToolsetRow[]>("/api/toolsets"),
   toolsetToggle: (name: string, enabled: boolean) =>
-    j<{ ok: boolean; name: string; enabled: boolean; note?: string }>(`/api/toolsets/${encodeURIComponent(name)}/toggle`, body("POST", { enabled })),
+    apiSend<{ ok: boolean; name: string; enabled: boolean; note?: string }>("POST", `/api/toolsets/${encodeURIComponent(name)}/toggle`, { enabled }),
 
+  // File attach: read the File in the WebView, hand base64 to Rust which posts
+  // a real multipart form to /api/attach (text → inline, image → Gemini vision).
   attach: async (f: File) => {
-    const fd = new FormData(); fd.append("file", f);
-    const r = await fetch(BASE + "/api/attach", { method: "POST", body: fd });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json() as Promise<{ ok: boolean; kind: string; name: string; size: number; block: string; error?: string }>;
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let bin = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < buf.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + CHUNK)) as unknown as number[]);
+    }
+    const data_base64 = btoa(bin);
+    return invoke<{ ok: boolean; kind: string; name: string; size: number; block: string; error?: string }>(
+      "api_upload", { path: "/api/attach", filename: f.name, contentType: f.type || "", dataBase64: data_base64 },
+    );
   },
 
   chat: (message: string, mode: Mode, conversation_id = "eva_desktop") =>
-    j<{ reply: string; mode: string }>("/api/chat", body("POST", { message, mode, conversation_id })),
+    apiSend<{ reply: string; mode: string }>("POST", "/api/chat", { message, mode, conversation_id }),
 };
 
-// Streaming chat over SSE — onToken per word, onDone at the end.
+// ── streamed chat over a Tauri Channel (real SSE forwarded by Rust) ──────────
 export async function chatStream(
   message: string, mode: Mode, conversation_id: string,
   onToken: (t: string) => void, onDone: (reply: string) => void, onError: (e: string) => void,
   provider?: string, model?: string, effort?: string,
 ) {
   try {
-    const r = await fetch(BASE + "/api/chat/stream", body("POST", { message, mode, conversation_id, provider, model, effort }));
-    if (!r.ok || !r.body) { onError(`HTTP ${r.status}`); return; }
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const parts = buf.split("\n\n");
-      buf = parts.pop() || "";
-      for (const part of parts) {
-        const line = part.trim();
-        if (!line.startsWith("data:")) continue;
-        try {
-          const p = JSON.parse(line.slice(5).trim());
-          if (p.done) onDone(p.reply || "");
-          else if (p.token) onToken(p.token);
-        } catch { /* skip */ }
-      }
-    }
+    const channel = new Channel<any>();
+    channel.onmessage = (msg) => {
+      if (!msg || typeof msg !== "object") return;
+      if (msg.kind === "token" && typeof msg.token === "string") onToken(msg.token);
+      else if (msg.kind === "done") onDone(typeof msg.reply === "string" ? msg.reply : "");
+    };
+    await invoke("eva_chat_stream", {
+      message, mode, conversationId: conversation_id,
+      provider: provider ?? null, model: model ?? null, effort: effort ?? null,
+      onEvent: channel,
+    });
   } catch (e) {
     onError(String(e));
   }
 }
 
-// ── OS integration via Rust (optional; no-op in a plain browser) ─────────────
+// ── OS + local desktop state (Rust-owned) ────────────────────────────────────
 async function invokeSafe<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
   try {
-    const w = window as any;
-    const invoke = w.__TAURI__?.core?.invoke ?? w.__TAURI__?.invoke;
-    if (!invoke) return null;
-    return await invoke(cmd, args);
+    return await invoke<T>(cmd, args);
   } catch {
     return null;
   }
@@ -160,6 +164,8 @@ async function invokeSafe<T>(cmd: string, args?: Record<string, unknown>): Promi
 
 export const os = {
   notify: (title: string, bodyText: string) => invokeSafe<void>("notify", { title, body: bodyText }),
-  runtimeStart: () => invokeSafe<any>("runtime_start"),
-  runtimeStatus: () => invokeSafe<any>("runtime_status"),
+  runtimeStatus: () => invokeSafe<{ reachable: boolean; launched_by_us: boolean; bridge_url: string }>("runtime_status"),
+  // desktop-persistent settings live in eva.db (single source of truth, not localStorage)
+  getSettings: () => invokeSafe<Record<string, string>>("all_settings"),
+  setSetting: (key: string, value: string) => invokeSafe<void>("set_setting", { key, value }),
 };
