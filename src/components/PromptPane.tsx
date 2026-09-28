@@ -4,7 +4,7 @@ import { api, type PromptFileMeta } from "../lib/eva";
 
 const META: Record<string, { icon: LucideIcon; designation: string; blurb: string; accent?: boolean }> = {
   SOUL: { icon: Brain, designation: "ЛИЧНОСТЬ ЕВЫ · ОТДЕЛЬНО", blurb: "Голос, характер и принципы Евы. Не превращается в USER.md и не присваивает историю Ивана.", accent: true },
-  MEMORY: { icon: FileClock, designation: "РАБОЧЕЕ СОСТОЯНИЕ", blurb: "То, что держится на виду в каждом ходе. Правится и Евой, и тобой. В Studio не видно — это текст промпта." },
+  MEMORY: { icon: FileClock, designation: "РАБОЧЕЕ СОСТОЯНИЕ", blurb: "То, что держится на виду в каждом ходе. Правится и Евой, и тобой — это текст промпта." },
   USER: { icon: Fingerprint, designation: "СТАБИЛЬНОЕ ОБ ИВАНЕ", blurb: "Модель пользователя: кто ты, а не биография Евы." },
 };
 
@@ -48,7 +48,7 @@ export default function PromptPane({ notify, onBack }: { notify: (m: string) => 
       <div className="utility-scroll">
         <div className="utility-content">
           <div className="utility-intro">
-            <span className="section-index">EVA / 03</span>
+            <span className="section-index">EVA / 02</span>
             <h2>Кто это знает.</h2>
             <p>Файлы, которые входят в системный промпт КАЖДОГО хода. Правь их — и Ева меняется. Перед записью делается бэкап. Это редактор модели: SOUL.md — характер, USER.md — модель тебя, MEMORY.md — рабочее состояние.</p>
           </div>

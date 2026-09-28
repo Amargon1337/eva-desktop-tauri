@@ -66,19 +66,25 @@ export default function MemoryPane({ live, notify, onBack }: { live: LiveState |
     if (!draft.content.trim()) { notify("Пустая запись"); return; }
     try {
       await api.memoryCreate(draft);
-      notify("Новая память записана в базу");
+      notify("Новая память записана в базу 🐾");
       setCreating(false); setDraft(emptyDraft);
       await load();
     } catch { notify("Не удалось создать"); }
   }
 
   async function archive(id: number) {
-    try { await api.memoryDelete(id, false); notify("Отправлено в архив (можно вернуть)"); await load(query.trim() || undefined); }
+    try { await api.memoryDelete(id, false);      notify("Отправила в архив — верну, если что"); await load(query.trim() || undefined); }
     catch { notify("Не удалось"); }
   }
   async function hardDelete(id: number) {
     try { await api.memoryDelete(id, true); notify("Удалено навсегда"); await load(query.trim() || undefined); }
     catch { notify("Не удалось"); }
+  }
+  // archive is a two-way door: ARCHIVED rows come back to CONFIRMED via the
+  // same update path Hermes itself uses (memory_history logs the flip)
+  async function restore(id: number) {
+    try { await api.memoryUpdate(id, { status: "CONFIRMED" }); notify("Вернула из архива"); await load(query.trim() || undefined); }
+    catch { notify("Не удалось вернуть"); }
   }
 
   const editor = (mode: "create" | "edit", id?: number) => (
@@ -106,7 +112,7 @@ export default function MemoryPane({ live, notify, onBack }: { live: LiveState |
       <div className="utility-scroll">
         <div className="utility-content">
           <div className="utility-intro">
-            <span className="section-index">EVA / 02</span>
+            <span className="section-index">EVA / 01</span>
             <h2>Я помню не на глаз.</h2>
             <p>Настоящие записи из memory.db. Гибридный поиск (FTS5 + смысловая близость), редактирование с аудит-историей, архив и жёсткое удаление. Один писатель — это та же база, которой пользуется Ева.</p>
           </div>
@@ -146,7 +152,11 @@ export default function MemoryPane({ live, notify, onBack }: { live: LiveState |
                       </div>
                       <div className="mem-row-actions">
                         <button onClick={() => startEdit(m)}><Pencil size={13} /> Изменить</button>
-                        <button onClick={() => archive(m.id)}><Trash2 size={13} /> В архив</button>
+                        {m.status === "ARCHIVED" ? (
+                          <button onClick={() => restore(m.id)}><History size={13} /> Вернуть из архива</button>
+                        ) : (
+                          <button onClick={() => archive(m.id)}><Trash2 size={13} /> В архив</button>
+                        )}
                         <button className="danger" onClick={() => hardDelete(m.id)}><X size={13} /> Удалить навсегда</button>
                       </div>
                       {history[m.id] && history[m.id].length > 0 && (

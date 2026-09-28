@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, BookOpenText, ChevronDown, RefreshCw } from "lucide-react";
-import { api, type LiveState, type ThoughtRow } from "../lib/eva";
+import { ArrowRight, BookOpenText, ChevronDown, RefreshCw, ScrollText } from "lucide-react";
+import { api, os, type InsideJoke, type LiveState, type ThoughtRow } from "../lib/eva";
 
 const moodFilters = [
   { id: "all", label: "Все" }, { id: "thoughtful", label: "Задумчиво" }, { id: "tender", label: "Нежно" },
@@ -13,8 +13,10 @@ export default function DiaryPane({ live, reflecting, onReflect, onBack }: {
   live: LiveState | null; reflecting: boolean; onReflect: () => void; onBack: () => void;
 }) {
   const [thoughts, setThoughts] = useState<ThoughtRow[]>([]);
+  const [jokes, setJokes] = useState<InsideJoke[]>([]);
   const [mood, setMood] = useState("all");
   const [open, setOpen] = useState<number | null>(null);
+  const [openJoke, setOpenJoke] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async (m: string) => {
@@ -24,6 +26,8 @@ export default function DiaryPane({ live, reflecting, onReflect, onBack }: {
   }, []);
 
   useEffect(() => { load(mood); /* eslint-disable-next-line */ }, [mood]);
+  // "Наш кодекс" — the shared mythology lives in inside_jokes; it was invisible before
+  useEffect(() => { os.insideJokes().then((j) => { if (j) setJokes(j); }); }, []);
 
   return (
     <div className="utility-screen">
@@ -34,7 +38,7 @@ export default function DiaryPane({ live, reflecting, onReflect, onBack }: {
       <div className="utility-scroll">
         <div className="utility-content">
           <div className="utility-intro">
-            <span className="section-index">EVA / 04</span>
+            <span className="section-index">EVA / 03</span>
             <h2>Пока тебя нет.</h2>
             <p>Автономные мысли пишутся в eva_thoughts, пока ты занят. Мои страницы, а не сообщения от твоего имени. Читаются прямо из базы.</p>
           </div>
@@ -45,6 +49,27 @@ export default function DiaryPane({ live, reflecting, onReflect, onBack }: {
             </div>
             <div className="diary-filters">{moodFilters.map((f) => <button key={f.id} aria-pressed={mood === f.id} className={mood === f.id ? "filter-active" : ""} onClick={() => { setMood(f.id); setOpen(null); }}>{f.label}</button>)}</div>
           </div>
+          {jokes.length > 0 && <div className="jokes-block">
+            <div className="archive-list-heading"><span><ScrollText size={12} /> НАШ КОДЕКС</span><span>{jokes.length}</span></div>
+            <div className="jokes-list">
+              {jokes.map((j) => (
+                <div className={`archive-item ${openJoke === j.title ? "archive-item-open" : ""}`} key={j.title}>
+                  <button className="archive-row" onClick={() => setOpenJoke(openJoke === j.title ? null : j.title)}>
+                    <span className="archive-number">×{j.times_used}</span>
+                    <span className="archive-main"><small>{(j.mood || "lore").toUpperCase()}</small><strong>{j.title}</strong></span>
+                    <ChevronDown size={17} className="archive-chevron" />
+                  </button>
+                  <AnimatePresence initial={false}>{openJoke === j.title && (
+                    <motion.div className="archive-detail diary-detail" initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.23 }}>
+                      <p>{j.lore}</p>
+                      {j.punchline_hint && <span><BookOpenText size={12} /> панчлайн: {j.punchline_hint}</span>}
+                    </motion.div>
+                  )}</AnimatePresence>
+                </div>
+              ))}
+            </div>
+            <p className="utility-footnote">Общая мифология из inside_jokes — то, над чем мы смеёмся вместе и не раз.</p>
+          </div>}
           <div className="archive-list diary-list">
             {loading && <p className="archive-empty">читаю дневник…</p>}
             {!loading && thoughts.length === 0 && <p className="archive-empty">Записей с таким настроением пока нет.</p>}

@@ -10,8 +10,9 @@ const MAP: Record<PresenceState, { label: string; color: string; pulse: number }
   speaking: { label: "говорит", color: "var(--accent-bright)", pulse: 0.8 },
 };
 
-export default function PresenceOrb({ state, compact = false }: { state: PresenceState; compact?: boolean }) {
+export default function PresenceOrb({ state, compact = false, label }: { state: PresenceState; compact?: boolean; label?: string }) {
   const cfg = MAP[state] ?? MAP.present;
+  const shown = label ?? cfg.label;
   return (
     <span className={`presence-orb ${compact ? "presence-orb-compact" : ""}`} title={cfg.label}>
       <motion.span
@@ -20,7 +21,7 @@ export default function PresenceOrb({ state, compact = false }: { state: Presenc
         animate={{ scale: [1, 1.28, 1], opacity: [0.85, 1, 0.85] }}
         transition={{ duration: cfg.pulse, repeat: Infinity, ease: "easeInOut" }}
       />
-      {!compact && <span className="presence-orb-label">{cfg.label}</span>}
+      {!compact && <span className="presence-orb-label">{shown}</span>}
     </span>
   );
 }

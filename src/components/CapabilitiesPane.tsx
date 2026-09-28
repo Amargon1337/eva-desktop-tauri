@@ -76,7 +76,7 @@ export default function CapabilitiesPane({ notify, onBack }: { notify?: (m: stri
       <div className="utility-scroll">
         <div className="utility-content">
           <div className="utility-intro">
-            <span className="section-index">EVA / 04</span>
+            <span className="section-index">EVA / 04 · ЕДИНОЕ</span>
             <h2>Мой арсенал.</h2>
             <p>Навыки (процедурная память, грузятся по релевантности) и инструменты ядра. Кликни навык — прочитаешь и отредактируешь его SKILL.md прямо тут. Инструмент — переключишь тумблером (правит config.yaml, вступает в силу со следующей сессии).</p>
           </div>

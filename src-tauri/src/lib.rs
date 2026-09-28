@@ -427,7 +427,223 @@ fn reap_runtime(app: &AppHandle) {
     }
 }
 
-// ── local db commands ────────────────────────────────────────────────────────
+// ── Hermes core passthrough (read-only): jokes, living thought, artifacts ────
+// These read memory.db THROUGH the core's HTTP API — the core remains the only
+// memory.db reader/writer; the desktop never opens that file itself.
+
+#[derive(Serialize, Clone)]
+struct InsideJoke {
+    title: String,
+    lore: String,
+    punchline_hint: Option<String>,
+    mood: Option<String>,
+    times_used: i64,
+}
+
+/// "Наш кодекс" — the shared mythology column of memory.db.
+#[tauri::command]
+async fn eva_inside_jokes() -> Result<Vec<InsideJoke>, String> {
+    let v = bridge::request(
+        "GET",
+        "/api/jokes",
+        None,
+    )
+    .await?;
+    let arr = v.as_array().cloned().unwrap_or_default();
+    Ok(arr
+        .iter()
+        .map(|j| InsideJoke {
+            title: j.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            lore: j.get("lore").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            punchline_hint: j.get("punchline_hint").and_then(|x| x.as_str()).map(String::from),
+            mood: j.get("mood").and_then(|x| x.as_str()).map(String::from),
+            times_used: j.get("times_used").and_then(|x| x.as_i64()).unwrap_or(0),
+        })
+        .collect())
+}
+
+/// The living thought: latest NON-PRIVATE eva_thoughts entry. Eva's private
+/// inner monologue must not be surveilled by the UI — the filter lives on the
+/// Rust side so the frontend cannot accidentally leak it.
+#[derive(Serialize, Clone)]
+struct LivingThought {
+    content: String,
+    mood: Option<String>,
+    thought_type: Option<String>,
+    created_at: Option<String>,
+}
+
+#[tauri::command]
+async fn eva_living_thought() -> Result<Option<LivingThought>, String> {
+    // the core's /api/thoughts serves newest-first; filter is_private here.
+    let v = bridge::request("GET", "/api/thoughts?limit=30", None).await?;
+    let arr = v.as_array().cloned().unwrap_or_default();
+    Ok(arr
+        .iter()
+        .find(|t| t.get("is_private").and_then(|p| p.as_i64()).unwrap_or(0) == 0)
+        .map(|t| LivingThought {
+            content: t.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            mood: t.get("mood").and_then(|x| x.as_str()).map(String::from),
+            thought_type: t.get("thought_type").and_then(|x| x.as_str()).map(String::from),
+            created_at: t.get("created_at").and_then(|x| x.as_str()).map(String::from),
+        }))
+}
+
+/// Save a generated artifact to disk. Ivan wants WORKING artifacts, not code
+/// pasted into chat: /save writes the last code block into a real file.
+#[tauri::command]
+fn eva_save_artifact(
+    app: AppHandle,
+    name: String,
+    content: String,
+) -> Result<String, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let artifacts = dir.join("artifacts");
+    std::fs::create_dir_all(&artifacts).map_err(|e| e.to_string())?;
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let safe_name = if safe_name.is_empty() { "artifact.txt".to_string() } else { safe_name };
+    let path = artifacts.join(&safe_name);
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Open a saved artifact (or its folder) in the system explorer.
+#[tauri::command]
+fn eva_open_path(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener().open_path(path, None::<&str>).map_err(|e| e.to_string())
+}
+
+// ── memory backup: "без памяти нет Евы" ──────────────────────────────────────
+// The dying-SSD insurance. The desktop NEVER writes to memory.db itself — the
+// backup is a byte-level file copy of the core's SQLite (WAL included via the
+// -wal/-shm sidecars). We do NOT use rusqlite::backup here because the desktop
+// would have to open memory.db directly, violating the single-writer rule.
+
+#[derive(Serialize, Clone)]
+struct BackupInfo {
+    ok: bool,
+    path: Option<String>,
+    bytes: u64,
+    error: Option<String>,
+}
+
+#[tauri::command]
+async fn eva_backup_memory(app: AppHandle) -> Result<BackupInfo, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let backups = dir.join("memory-backups");
+    tokio::task::spawn_blocking(move || -> Result<BackupInfo, String> {
+        if let Err(e) = std::fs::create_dir_all(&backups) {
+            return Ok(BackupInfo { ok: false, path: None, bytes: 0, error: Some(e.to_string()) });
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dst = backups.join(format!("memory-{stamp}.db"));
+        let src = discover_memory_db();
+        let Some(src) = src else {
+            return Ok(BackupInfo { ok: false, path: None, bytes: 0, error: Some("memory.db не найдена".into()) });
+        };
+        // byte-level copy: main + WAL sidecars so an in-flight checkpoint
+        // cannot produce a torn backup
+        match copy_db_family(&src, &dst) {
+            Ok(bytes) => {
+                // keep only the newest 10 — backups are insurance, not an archive
+                prune_backups(&backups, 10);
+                Ok(BackupInfo { ok: true, path: Some(dst.to_string_lossy().into_owned()), bytes, error: None })
+            }
+            Err(e) => Ok(BackupInfo { ok: false, path: None, bytes: 0, error: Some(e) }),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Locate the core's memory.db using the SAME discovery order as runtime_start.
+fn discover_memory_db() -> Option<PathBuf> {
+    let mut homes: Vec<PathBuf> = vec![];
+    for k in ["EVA_HERMES_HOME", "HERMES_HOME"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                homes.push(PathBuf::from(v));
+            }
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        homes.push(PathBuf::from(local).join("hermes"));
+    }
+    if let Some(home) = std::env::var("USERPROFILE").ok().map(PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+    {
+        homes.push(home.join(".hermes"));
+    }
+    for home in homes {
+        let cand = home.join("memory.db");
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn copy_db_family(src: &std::path::Path, dst: &std::path::Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for suffix in ["", "-wal", "-shm"] {
+        let s = PathBuf::from(format!("{}{}", src.display(), suffix));
+        if !s.exists() {
+            continue;
+        }
+        let d = PathBuf::from(format!("{}{}", dst.display(), suffix));
+        let n = std::fs::copy(&s, &d).map_err(|e| format!("копирование {}: {e}", s.display()))?;
+        total += n;
+    }
+    if total == 0 {
+        return Err("исходник пуст".into());
+    }
+    Ok(total)
+}
+
+fn prune_backups(dir: &std::path::Path, keep: usize) {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("db") {
+                let m = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                files.push((m, p));
+            }
+        }
+    }
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, p) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Last backup timestamp for the System pane badge.
+#[tauri::command]
+fn eva_last_backup(app: AppHandle) -> Option<String> {
+    let dir = app.path().app_data_dir().ok()?;
+    let backups = dir.join("memory-backups");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let rd = std::fs::read_dir(&backups).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("db") {
+            let m = e.metadata().and_then(|m| m.modified()).ok()?;
+            if newest.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+                newest = Some((m, p));
+            }
+        }
+    }
+    newest.map(|(_, p)| p.to_string_lossy().into_owned())
+}
+
+// ── local db commands ────────────────────────────────────────────────────
 #[tauri::command]
 fn get_setting(db: State<'_, Db>, key: String) -> Option<String> {
     let conn = db.0.lock().ok()?;
@@ -459,15 +675,9 @@ fn local_presence(db: State<'_, Db>, limit: Option<i64>) -> Result<Vec<db::Prese
 }
 
 // ── OS integration ───────────────────────────────────────────────────────────
-#[tauri::command]
-fn notify(app: AppHandle, title: String, body: String) -> Result<(), String> {
-    app.notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show()
-        .map_err(|e| e.to_string())
-}
+// Notifications are Rust-side only (tray "Новая мысль"): the JS `notify`
+// command was dead code — the frontend never sends notifications.
+// The notification plugin stays registered for those Rust-side uses.
 
 // ── presence poller: telemetry → live state + local trail ────────────────────
 // Single source of presence truth. React subscribes to `eva://presence` and
@@ -642,7 +852,12 @@ pub fn run() {
             all_settings,
             local_events,
             local_presence,
-            notify,
+            eva_inside_jokes,
+            eva_living_thought,
+            eva_save_artifact,
+            eva_open_path,
+            eva_backup_memory,
+            eva_last_backup,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Eva Desktop")

@@ -150,6 +150,34 @@ async fn stop_aborts_hung_sse_read_instantly() {
 }
 
 // ── scenario 2: stale permit must not poison the next stream ─────────────────
+
+/// Mirror of the production cancel slot: `Runtime.chat_cancel`
+/// (`Mutex<Arc<Notify>>` in lib.rs) plus the exact swap protocol of the
+/// `eva_chat_stream` wrapper and `eva_chat_stop`. Kept in lockstep with lib.rs
+/// BY THIS TEST: the wrapper swaps a fresh Notify per stream (`begin`), the
+/// stop command fires whatever is CURRENTLY registered (`clone_current`). If
+/// that protocol ever changes, this mirror must change with it — it IS the
+/// contract under test here.
+struct CancelSlot(std::sync::Mutex<Arc<Notify>>);
+
+impl CancelSlot {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(Arc::new(Notify::new())))
+    }
+    /// eva_chat_stream wrapper on stream start: swap a FRESH Notify into the
+    /// slot and hand it to the new stream. Any stale stop permit dies with the
+    /// Notify it was captured from.
+    fn begin(&self) -> Arc<Notify> {
+        let fresh = Arc::new(Notify::new());
+        *self.0.lock().unwrap() = fresh.clone();
+        fresh
+    }
+    /// eva_chat_stop body: clone whatever stream is CURRENTLY registered.
+    fn clone_current(&self) -> Arc<Notify> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 #[tokio::test]
 async fn stop_does_not_break_the_next_stream() {
     // stream A: one token, then hang forever (this is the one we /stop)
@@ -162,31 +190,50 @@ async fn stop_does_not_break_the_next_stream() {
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n\n         data: {\"token\":\"а\"}\r\n\r\ndata: {\"done\":true,\"reply\":\"а\"}\r\n\r\n",
     )
     .await;
-    let cancel_a = Arc::new(Notify::new());
-    let events_a = Events::default();
 
+    // THE PRODUCTION SLOT: both streams and the stop command share one slot,
+    // exactly like Runtime.chat_cancel in the real app.
+    let slot = CancelSlot::new();
+
+    // 1) stream A begins — the wrapper swaps Notify A into the slot
+    let cancel_a = slot.begin();
+    let events_a = Events::default();
     let handle_a = tokio::spawn(run(port_a, cancel_a.clone(), events_a.clone()));
     wait_for(&events_a, |es| !es.is_empty(), "stream A first token").await;
 
-    // /stop stream A — the stale permit must die with A's Notify
-    cancel_a.notify_one();
+    // 2) /stop while A is current: the command clones what's registered NOW
+    //    (Notify A) and fires it — A aborts
+    let stale_stop = slot.clone_current();
+    assert!(
+        Arc::ptr_eq(&stale_stop, &cancel_a),
+        "stop must target the CURRENT stream's Notify"
+    );
+    stale_stop.notify_one();
     tokio::time::timeout(Duration::from_secs(2), handle_a)
         .await
         .expect("stream A aborted")
         .unwrap()
         .unwrap();
 
-    // ...then start stream B on the same shared reqwest client (same as prod:
-    // bridge::client() is a global pool). B must stream to completion.
-    let cancel_b = Arc::new(Notify::new());
+    // 3) stream B begins — the same swap model hands B a FRESH Notify B
+    let cancel_b = slot.begin();
+    assert!(
+        !Arc::ptr_eq(&cancel_b, &cancel_a),
+        "B must receive a fresh Notify, not A's"
+    );
     let events_b = Events::default();
     let handle_b = tokio::spawn(run(port_b, cancel_b.clone(), events_b.clone()));
     wait_for(&events_b, |es| !es.is_empty(), "stream B first token").await;
+
+    // 4) the STALE stop fires LATE — a permit captured from A's era must be
+    //    physically unable to cancel B (B waits on Notify B; A is orphaned)
+    stale_stop.notify_one();
     tokio::time::timeout(Duration::from_secs(2), handle_b)
         .await
-        .expect("stream B must complete")
+        .expect("stream B must complete despite the stale stop")
         .unwrap()
         .unwrap();
+
     assert_eq!(events_b.tokens(), vec!["а"]);
     assert_eq!(events_b.kinds().last().unwrap(), "presence");
     // B completed NORMALLY — real reply, no aborted done

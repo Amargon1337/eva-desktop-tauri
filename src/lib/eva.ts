@@ -13,6 +13,7 @@
 // withGlobalTauri is also on, but the import is what makes it reliable).
 
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { openPath } from "@tauri-apps/plugin-opener";
 
 export type Mode = "sakura" | "yandere";
 export type PresenceState = "present" | "idle" | "away" | "thinking" | "speaking";
@@ -33,8 +34,12 @@ export type MemoryHistory = {
   id: number; action: string; old_content: string | null; new_content: string | null;
   reason: string | null; changed_by: string; created_at: string;
 };
-export type PinRow = { id: number; content: string; type: string };
 export type ThoughtRow = { id: number; type: string | null; mood: string | null; trigger: string | null; content: string; created_at: string | null };
+export type JournalRow = { id: number; kind: string; payload: string; created_at: string };
+export type PinRow = { id: number; content: string; type: string };
+export type InsideJoke = { title: string; lore: string; punchline_hint: string | null; mood: string | null; times_used: number };
+export type LivingThought = { content: string; mood: string | null; thought_type: string | null; created_at: string | null };
+export type BackupInfo = { ok: boolean; path: string | null; bytes: number; error: string | null };
 export type ServiceRow = {
   id: string; name: string; running: boolean; port: number | null; memory_mb: number; uptime: string;
   category?: string; description?: string; pid?: number | null; process_count?: number;
@@ -67,14 +72,11 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 
 export const api = {
   state: () => apiGet<LiveState>("/api/state"),
-  reachable: async () => { try { await apiGet("/api/state"); return true; } catch { return false; } },
 
   conversations: (limit = 60) => apiGet<ConversationRow[]>(`/api/conversations${qs({ limit })}`),
   conversationMessages: (id: string, limit = 300) =>
     apiGet<{ id: number; role: string; content: string; ts: string }[]>(`/api/conversations/${encodeURIComponent(id)}/messages${qs({ limit })}`),
   deleteConversation: (id: string) => apiSend<{ ok: boolean; deleted: number }>("DELETE", `/api/conversations/${encodeURIComponent(id)}`),
-  history: (limit = 80, conversation_id = "eva_desktop") =>
-    apiGet<HistoryRow[]>(`/api/history${qs({ limit, conversation_id })}`),
 
   memory: (search?: string, limit = 80, includeArchived = false) =>
     apiGet<MemoryRow[]>(`/api/memory${qs(search ? { search, include_archived: includeArchived || undefined } : { limit, include_archived: includeArchived || undefined })}`),
@@ -84,7 +86,7 @@ export const api = {
   memoryUpdate: (id: number, b: Partial<{ content: string; memory_type: string; importance: string; category: string; confidence: number; status: string; tags: string[] }>) =>
     apiSend<{ ok: boolean; memory: MemoryRow }>("PUT", `/api/memory/${id}`, b),
   memoryDelete: (id: number, hard = false) => apiSend<{ ok: boolean }>("DELETE", `/api/memory/${id}${qs({ hard })}`),
-  pins: (limit = 12) => apiGet<PinRow[]>(`/api/pins${qs({ limit })}`),
+  pins: (limit = 8) => apiGet<PinRow[]>(`/api/pins${qs({ limit })}`),
 
   promptfiles: () => apiGet<PromptFileMeta[]>("/api/promptfiles"),
   promptfileGet: (key: string) => apiGet<{ key: string; name: string; content: string }>(`/api/promptfiles/${key}`),
@@ -92,7 +94,6 @@ export const api = {
 
   entities: (limit = 100) => apiGet<EntityRow[]>(`/api/entities${qs({ limit })}`),
   contradictions: () => apiGet<any[]>("/api/contradictions"),
-  jokes: () => apiGet<any[]>("/api/jokes"),
   thoughts: (limit = 80, mood?: string) => apiGet<ThoughtRow[]>(`/api/thoughts${qs({ limit, mood: mood && mood !== "all" ? mood : undefined })}`),
   reflect: () => apiSend<{ ok: boolean }>("POST", "/api/reflect", {}),
 
@@ -111,6 +112,7 @@ export const api = {
   toolsetToggle: (name: string, enabled: boolean) =>
     apiSend<{ ok: boolean; name: string; enabled: boolean; note?: string }>("POST", `/api/toolsets/${encodeURIComponent(name)}/toggle`, { enabled }),
 
+
   // File attach: read the File in the WebView, hand raw bytes to Rust as a
   // number[] over IPC (no base64 double-copy). Rust posts a real multipart form
   // to /api/attach (text → inline, image → Gemini vision). 25 MB ceiling.
@@ -124,9 +126,6 @@ export const api = {
       "api_upload", { path: "/api/attach", filename: f.name, contentType: f.type || "", bytes },
     );
   },
-
-  chat: (message: string, mode: Mode, conversation_id = "eva_desktop") =>
-    apiSend<{ reply: string; mode: string }>("POST", "/api/chat", { message, mode, conversation_id }),
 };
 
 // ── streamed chat over a Tauri Channel (real SSE forwarded by Rust) ──────────
@@ -167,8 +166,22 @@ async function invokeSafe<T>(cmd: string, args?: Record<string, unknown>): Promi
 }
 
 export const os = {
-  notify: (title: string, bodyText: string) => invokeSafe<void>("notify", { title, body: bodyText }),
+  // runtime health: who owns the core process and is it answering at all
   runtimeStatus: () => invokeSafe<{ reachable: boolean; launched_by_us: boolean; bridge_url: string }>("runtime_status"),
+  // bootstrap the FastAPI core if nothing answers on the bridge (idempotent in Rust)
+  runtimeStart: () => invokeSafe<{ reachable: boolean; launched_by_us: boolean; bridge_url: string }>("runtime_start"),
+  // rolling desktop event trail from eva.db (runtime starts/stops, presence)
+  localEvents: (limit = 60) => invokeSafe<JournalRow[]>("local_events", { limit }),
+  // shared mythology (inside_jokes) and Eva's latest non-private thought
+  insideJokes: () => invokeSafe<InsideJoke[]>("eva_inside_jokes"),
+  livingThought: () => invokeSafe<LivingThought | null>("eva_living_thought"),
+  // "без памяти нет Евы": byte-level backup of the core's memory.db family
+  backupMemory: () => invokeSafe<BackupInfo>("eva_backup_memory"),
+  lastBackup: () => invokeSafe<string | null>("eva_last_backup"),
+  // working artifacts, not code pasted into chat
+  saveArtifact: (name: string, content: string) =>
+    invoke<string>("eva_save_artifact", { name, content }).catch(() => null),
+  openPath: (path: string) => openPath(path).catch(() => {}),
   // desktop-persistent settings live in eva.db (single source of truth, not localStorage)
   getSettings: () => invokeSafe<Record<string, string>>("all_settings"),
   setSetting: (key: string, value: string) => invokeSafe<void>("set_setting", { key, value }),

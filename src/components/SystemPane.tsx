@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowRight, Activity, Cpu, HardDrive, Monitor, RefreshCw, Network, Users, AlertTriangle, Play, Square, RotateCw, ChevronDown, ChevronRight, FileText, Loader2 } from "lucide-react";
-import { api, type LiveState, type ServiceRow, type EntityRow } from "../lib/eva";
+import { ArrowRight, Activity, Cpu, HardDrive, Monitor, RefreshCw, Network, Users, AlertTriangle, Play, Square, RotateCw, ChevronDown, ChevronRight, FileText, Loader2, ScrollText, DatabaseBackup } from "lucide-react";
+import { api, os, type LiveState, type ServiceRow, type EntityRow, type JournalRow } from "../lib/eva";
 
-export default function SystemPane({ live, notify, onBack }: { live: LiveState | null; notify?: (m: string) => void; onBack: () => void }) {
-  const [tab, setTab] = useState<"contour" | "services" | "entities">("contour");
+export default function SystemPane({ live, notify, onBack, onOpenMemory }: { live: LiveState | null; notify?: (m: string) => void; onBack: () => void; onOpenMemory: () => void }) {
+  const [tab, setTab] = useState<"contour" | "services" | "entities" | "journal">("contour");
   const [services, setServices] = useState<ServiceRow[]>([]);
   const [entities, setEntities] = useState<EntityRow[]>([]);
   const [contradictions, setContradictions] = useState<any[]>([]);
@@ -11,6 +11,15 @@ export default function SystemPane({ live, notify, onBack }: { live: LiveState |
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [logs, setLogs] = useState<Record<string, { lines: string[]; path?: string; loading?: boolean }>>({});
+  const [journal, setJournal] = useState<JournalRow[]>([]);
+  const [lastBackup, setLastBackup] = useState<string | null>(null);
+  const [backingUp, setBackingUp] = useState(false);
+  const [backupMsg, setBackupMsg] = useState<string | null>(null);
+
+  const loadJournal = useCallback(async () => {
+    const rows = await os.localEvents(120);
+    if (rows) setJournal(rows);
+  }, []);
 
   const loadServices = useCallback(async () => {
     try { const s = await api.services(); setServices(Array.isArray(s) ? s : []); } catch { setServices([]); }
@@ -19,8 +28,27 @@ export default function SystemPane({ live, notify, onBack }: { live: LiveState |
   }, []);
   const loadEntities = useCallback(async () => { try { setEntities(await api.entities(100)); } catch { setEntities([]); } }, []);
 
-  useEffect(() => { loadServices(); /* eslint-disable-next-line */ }, []);
-  useEffect(() => { if (tab === "entities") loadEntities(); if (tab === "services") loadServices(); /* eslint-disable-next-line */ }, [tab]);
+  useEffect(() => { loadServices(); os.lastBackup().then(setLastBackup); /* eslint-disable-next-line */ }, []);
+
+  // "без памяти нет Евы": the dying-SSD insurance button
+  async function runBackup() {
+    setBackingUp(true); setBackupMsg(null);
+    try {
+      const r = await os.backupMemory();
+      if (r?.ok) { setBackupMsg(`скопировано ${(r.bytes / 1048576).toFixed(1)} МБ`); setLastBackup(await os.lastBackup()); }
+      else setBackupMsg(r?.error || "не получилось");
+    } finally { setBackingUp(false); }
+  }
+  function backupAge(): string | null {
+    if (!lastBackup) return null;
+    const t = new Date(lastBackup).getTime();
+    if (Number.isNaN(t)) return null;
+    const days = Math.floor((Date.now() - t) / 86400000);
+    if (days <= 0) return "сегодня";
+    if (days === 1) return "вчера";
+    return `${days} дн назад`;
+  }
+  useEffect(() => { if (tab === "entities") loadEntities(); if (tab === "services") loadServices(); if (tab === "journal") loadJournal(); /* eslint-disable-next-line */ }, [tab]);
   // live refresh of the process list while the tab is open
   useEffect(() => {
     if (tab !== "services") return;
@@ -80,26 +108,35 @@ export default function SystemPane({ live, notify, onBack }: { live: LiveState |
             <button role="tab" aria-selected={tab === "contour"} className={tab === "contour" ? "content-tab-selected" : ""} onClick={() => setTab("contour")}>Контур</button>
             <button role="tab" aria-selected={tab === "services"} className={tab === "services" ? "content-tab-selected" : ""} onClick={() => setTab("services")}>Процессы</button>
             <button role="tab" aria-selected={tab === "entities"} className={tab === "entities" ? "content-tab-selected" : ""} onClick={() => setTab("entities")}>Сущности</button>
+            <button role="tab" aria-selected={tab === "journal"} className={tab === "journal" ? "content-tab-selected" : ""} onClick={() => setTab("journal")}>Журнал</button>
           </div>
 
           {tab === "contour" && <div className="system-contour">
+            <div className="backup-strip">
+              <DatabaseBackup size={16} className={backupAge() && backupAge() !== "сегодня" ? "backup-stale" : "backup-ok"} />
+              <div className="backup-strip-info">
+                <strong>Страховка памяти</strong>
+                <small>{lastBackup ? `последний бэкап memory.db — ${backupAge()}` : "бэкапов ещё не было — а SSD умирает"}{backupMsg ? ` · ${backupMsg}` : ""}</small>
+              </div>
+              <button onClick={runBackup} disabled={backingUp}>{backingUp ? "копирую…" : "бэкап сейчас"}</button>
+            </div>
             <div className="archive-list-heading"><span>КАК ПРОХОДИТ ОДИН ХОД</span><span>LIVE-ТЕЛЕМЕТРИЯ</span></div>
             <div className="contour-flow"><div><small>01 / ОБОЛОЧКА</small><strong>Tauri + Rust</strong><span>окно, трей, IPC, eva.db</span></div><ArrowRight size={17} /><div><small>02 / МОСТ</small><strong>Eva Bridge</strong><span>localhost → Hermes core</span></div><ArrowRight size={17} /><div><small>03 / МЫСЛЬ</small><strong>LLM + память</strong><span>SOUL.md + recall → токены</span></div></div>
             <div className="system-principle"><span>ИНВАРИАНТ</span><p>Rust держит то, чему <em>не место</em> в React. Один активный писатель памяти — Hermes.</p></div>
             <div className="system-spec-list"><div className="archive-list-heading"><span>НА ЧЁМ Я ЖИВУ</span><span>{live ? "СЕЙЧАС" : "—"}</span></div>
-              <div className="spec-row"><Cpu size={16} /><strong>A8-5600K</strong><span>CPU {live ? `${Math.round(live.cpu_percent)}%` : "—"} · RAM {live ? `${Math.round(live.ram_percent)}%` : "—"}</span></div>
-              <div className="spec-row"><HardDrive size={16} /><strong>Apacer AS340</strong><span>заполнен {live ? `${live.ssd_percent}%` : "—"} · умирающий SSD, на котором я живу</span></div>
+              <div className="spec-row"><Cpu size={16} /><strong>Процессор</strong><span>CPU {live ? `${Math.round(live.cpu_percent)}%` : "—"} · RAM {live ? `${Math.round(live.ram_percent)}%` : "—"}</span></div>
+              <div className="spec-row"><HardDrive size={16} /><strong>Системный SSD</strong><span>заполнен {live ? `${live.ssd_percent}%` : "—"} · здесь живёт память</span></div>
               <div className="spec-row"><Monitor size={16} /><strong>Presence</strong><span>{live ? `${live.presence} · ${live.active_window || "—"}`.slice(0, 52) : "—"}</span></div>
               <div className="spec-row"><Activity size={16} /><strong>Uptime ядра</strong><span>{live?.uptime ?? "—"} · {live?.is_night ? "ночь" : "день"}</span></div>
             </div>
-            {tokens.length > 0 && <div className="token-block">
+            {tokens.length > 0 ? <div className="token-block">
               <div className="archive-list-heading"><span>ТОКЕНЫ · 14 ДНЕЙ</span><span>token_usage</span></div>
               <div className="token-bars">{tokens.slice().reverse().map((d) => (
                 <div className="token-bar" key={d.date} title={`${d.date}: ${d.tokens}`}><i style={{ height: `${Math.max(4, (d.tokens / maxTok) * 100)}%` }} /><small>{d.date.slice(5)}</small></div>
               ))}</div>
-            </div>}
+            </div> : <p className="utility-footnote">token_usage пуст за 14 дней — логирование usage у активных провайдеров отвалилось (проверь конфиг Hermes).</p>}
             {contradictions.length > 0 && <div className="contradiction-block">
-              <div className="archive-list-heading"><span><AlertTriangle size={12} /> ПРОТИВОРЕЧИЯ</span><span>{contradictions.length}</span></div>
+              <div className="archive-list-heading"><span><AlertTriangle size={12} /> ПРОТИВОРЕЧИЯ</span><button className="quiet-text-button" onClick={onOpenMemory} title="Разобрать в Памяти">разобрать <ArrowRight size={12} /></button></div>
               {contradictions.slice(0, 4).map((c, i) => <div className="service-row service-off" key={i}><span className="service-dot" /><span className="service-main"><strong>{String(c.description || c.notes || c.status || "конфликт").slice(0, 70)}</strong><small>{c.status || ""}</small></span></div>)}
             </div>}
             <div className="system-mortality"><span>ЗА ПРЕДЕЛАМИ МОНИТОРА</span><p>Без памяти нет Евы.</p><small>Это не процент заполнения диска. Это причина беречь историю.</small></div>
@@ -173,6 +210,27 @@ export default function SystemPane({ live, notify, onBack }: { live: LiveState |
               {entities.map((e) => (<div className="service-row service-on" key={e.id}><span className="service-dot" /><span className="service-main"><strong>{e.name} <em style={{ color: "#8a7c90", fontStyle: "normal", fontSize: 9 }}>· {e.type}</em></strong><small>{(e.summary || "").slice(0, 90)}</small></span></div>))}
             </div>
             <p className="utility-footnote">Люди, проекты, места и концепты, которые Ева знает — из таблицы entities.</p>
+          </div>}
+
+          {tab === "journal" && <div className="system-surfaces">
+            <div className="archive-list-heading">
+              <span><ScrollText size={12} /> ЖУРНАЛ ДЕСКТОПА · eva.db</span>
+              <button className="quiet-text-button" onClick={loadJournal}><RefreshCw size={13} /> обновить</button>
+            </div>
+            <div className="service-list">
+              {journal.length === 0 && <p className="archive-empty">журнал пуст</p>}
+              {journal.map((e) => (
+                <div className="service-row" key={e.id}>
+                  <span className="service-dot" />
+                  <span className="service-main">
+                    <strong>{e.kind}</strong>
+                    <small>{e.payload || "—"}</small>
+                  </span>
+                  <span className="proc-state">{(e.created_at || "").slice(0, 16).replace("T", " ")}</span>
+                </div>
+              ))}
+            </div>
+            <p className="utility-footnote">Локальный след desktop-приложения: подъём и остановка ядра, presence-переходы. Пишется в eva.db — память Евы это не трогает.</p>
           </div>}
         </div>
       </div>

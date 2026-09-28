@@ -4,13 +4,16 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   Activity, ArrowRight, BookOpenText, Brain, ChevronRight, Command, Database, FileText,
   Flower2, Image as ImageIcon, Loader2, Menu, MessageCircle, Moon, MoreHorizontal, Paperclip, PanelRightClose, PanelRightOpen,
-  Plus, RefreshCw, Search, Settings2, Sparkles, Trash2, Wrench, X, type LucideIcon,
+  Plus, RefreshCw, Search, Settings2, Sparkles, Square, Trash2, Unplug, Wrench, X, type LucideIcon,
 } from "lucide-react";
 import {
   api, chatStream, chatStop, os as osIntegration,
-  type Mode, type PresenceState, type LiveState, type HistoryRow, type ConversationRow, type ModelCatalog, type Effort,
+  type Mode, type PresenceState, type LiveState, type HistoryRow, type ConversationRow, type ModelCatalog, type Effort, type LivingThought,
 } from "./lib/eva";
 import PresenceOrb from "./components/PresenceOrb";
+import ThinkingCard from "./components/ThinkingCard";
+import { Sidebar, type OrbitId } from "./components/Sidebar";
+import { PresencePanel } from "./components/PresencePanelV2";
 import MemoryPane from "./components/MemoryPane";
 import PromptPane from "./components/PromptPane";
 import DiaryPane from "./components/DiaryPane";
@@ -100,6 +103,9 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [streamBuf, setStreamBuf] = useState("");
   const [reflecting, setReflecting] = useState(false);
+  const [coreDown, setCoreDown] = useState(false);
+  const [coreBusy, setCoreBusy] = useState(false);
+  const [livingThought, setLivingThought] = useState<LivingThought | null>(null);
   const [toast, setToast] = useState("");
   const [clock, setClock] = useState(formatTime);
   const [loadingHistory, setLoadingHistory] = useState(true);
@@ -124,10 +130,21 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const toastRef = useRef<number | null>(null);
+  const sendingRef = useRef(false);
   const compactRef = useRef(window.innerWidth < 1200);
 
   useEffect(() => { if (prefsReady) { localStorage.setItem("eva-mode", mode); osIntegration.setSetting("mode", mode); } }, [mode, prefsReady]);
   useEffect(() => { if (prefsReady) { localStorage.setItem("eva-effort", effort); osIntegration.setSetting("effort", effort); } }, [effort, prefsReady]);
+  // composer draft lives in eva.db — a restart must never eat a half-typed letter
+  useEffect(() => {
+    (async () => {
+      try { const s = await osIntegration.getSettings(); const d = s?.composer_draft; if (typeof d === "string" && d) setComposer(d); } catch { /**/ }
+    })();
+  }, []);
+  useEffect(() => {
+    const t = window.setTimeout(() => { osIntegration.setSetting("composer_draft", composer); }, 400);
+    return () => window.clearTimeout(t);
+  }, [composer]);
   useEffect(() => { const i = window.setInterval(() => setClock(formatTime()), 15_000); return () => window.clearInterval(i); }, []);
 
   const refreshState = useCallback(async () => {
@@ -137,8 +154,24 @@ export default function App() {
       const idle = s.idle_seconds || 0;
       setPresence((prev) => (prev === "thinking" || prev === "speaking") ? prev : (idle > 900 ? "away" : idle > 120 ? "idle" : "present"));
     } catch { /* warming */ }
+    // her living thought — non-private only (Rust filters is_private)
+    try { const t = await osIntegration.livingThought(); if (t !== null) setLivingThought(t); } catch { /**/ }
   }, []);
   const refreshConversations = useCallback(async () => { try { setConversations(await api.conversations(60)); } catch { /**/ } }, []);
+  // runtime health from the Rust side: is the core answering, who owns it
+  const checkCore = useCallback(async () => {
+    const st = await osIntegration.runtimeStatus();
+    // null = plain browser dev (no bridge) — don't scream in that mode
+    if (st) setCoreDown(!st.reachable);
+  }, []);
+  const raiseCore = useCallback(async () => {
+    setCoreBusy(true);
+    try {
+      await osIntegration.runtimeStart(); // idempotent in Rust
+      await new Promise((r) => window.setTimeout(r, 900));
+      await refreshState();
+    } finally { setCoreBusy(false); await checkCore(); }
+  }, [checkCore, refreshState]);
 
   const loadConversation = useCallback(async (id: string) => {
     setLoadingHistory(true);
@@ -163,7 +196,7 @@ export default function App() {
         }
       } catch { /* plain browser dev — stick with localStorage seed */ }
       finally { setPrefsReady(true); } // only now may pref-writers persist (no localStorage→DB race)
-      await Promise.all([refreshState(), refreshConversations()]);
+      await Promise.all([refreshState(), refreshConversations(), checkCore()]);
       await loadConversation("eva_desktop");
       try { setModelCat(await api.models()); } catch { /**/ }
     })();
@@ -174,7 +207,7 @@ export default function App() {
       setPresence((prev) => (prev === "thinking" || prev === "speaking") ? prev : (p.state as PresenceState) || prev);
     });
     // gentle fallback poll in case events are missed (e.g. plain browser dev)
-    const s = window.setInterval(refreshState, 30_000);
+    const s = window.setInterval(() => { refreshState(); checkCore(); }, 30_000);
     return () => { window.clearInterval(s); unlisten.then((f) => f()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -190,10 +223,12 @@ export default function App() {
   useEffect(() => {
     function onKey(e: globalThis.KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); setSearchOpen((o) => !o); }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") { e.preventDefault(); newConversation(); }
       if (e.key === "Escape") { setSearchOpen(false); setMoreOpen(false); setSidebarOpen(false); if (window.innerWidth < 1200) setShowPresence(false); }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => { if (searchOpen) window.setTimeout(() => searchRef.current?.focus(), 50); else setSearchQuery(""); }, [searchOpen]);
   useEffect(() => () => { if (toastRef.current) window.clearTimeout(toastRef.current); }, []);
@@ -205,12 +240,12 @@ export default function App() {
   function newConversation() {
     const id = `desk_${Date.now().toString(36)}`;
     setConvId(id); setMessages([]); setPage("chat"); setMoreOpen(false); setSidebarOpen(false);
-    notify("Новый разговор. Первое сообщение его закрепит.");
+    notify("Новый разговор — первое сообщение его закрепит");
     window.setTimeout(() => textareaRef.current?.focus(), 100);
   }
 
   async function deleteConversation(id: string) {
-    try { await api.deleteConversation(id); notify("Разговор удалён из базы"); }
+    try { await api.deleteConversation(id); notify("Разговор стёрт из базы"); }
     catch { notify("Не удалось удалить"); }
     await refreshConversations();
     if (id === convId) { setConvId("eva_desktop"); loadConversation("eva_desktop"); }
@@ -233,6 +268,7 @@ export default function App() {
     const shownText = (shaped ? `⚡ ${raw}` : raw) || (attachments.length ? `📎 ${attachments.map((a) => a.name).join(", ")}` : "");
     setMessages((p) => [...p, { role: "user", content: shownText, ts: new Date().toISOString() }]);
     setComposer(""); setAttachments([]); setSending(true); setPresence("thinking"); setStreamBuf("");
+    sendingRef.current = true;
     window.setTimeout(scrollToBottom, 60);
     let acc = "";
     await chatStream(
@@ -242,6 +278,7 @@ export default function App() {
         setStreamBuf("");
         setMessages((p) => [...p, { role: "assistant", content: reply || acc, ts: new Date().toISOString() }]);
         setSending(false); setPresence("present");
+        sendingRef.current = false;
         refreshState(); refreshConversations();
         window.setTimeout(scrollToBottom, 60);
       },
@@ -249,9 +286,18 @@ export default function App() {
         setStreamBuf("");
         setMessages((p) => [...p, { role: "assistant", content: "Мур... связь с ядром оборвалась. 🐾 " + err, ts: new Date().toISOString() }]);
         setSending(false); setPresence("present");
+        sendingRef.current = false;
       },
       chosen?.provider, chosen?.model, effort,
     );
+  }
+
+  // real stop: Rust tears down the SSE (proven by tests/stop_cancellation.rs);
+  // done(aborted) comes back through the same channel and unlocks the composer
+  function stopStream() {
+    if (!sendingRef.current) return;
+    chatStop();
+    notify("Останавливаю…");
   }
 
   // ── slash commands — mirrors Hermes Desktop vocabulary ───────────────────
@@ -311,7 +357,35 @@ export default function App() {
     { cmd: "/skin", arg: "sakura|yandere", desc: "сменить облик", group: "облик", kind: "act", run: (a) => setMode(a.trim().toLowerCase() === "yandere" ? "yandere" : "sakura") },
     { cmd: "/sakura", desc: "светлый облик", group: "облик", kind: "act", run: () => setMode("sakura") },
     { cmd: "/yandere", desc: "тёмный облик", group: "облик", kind: "act", run: () => setMode("yandere") },
-    { cmd: "/help", desc: "список команд", group: "облик", kind: "act", run: () => notify("Команды: " + SLASH.map((s) => s.cmd).join(" ")) },
+    // Ivan wants WORKING artifacts, not code in chat: /save pulls the last
+    // fenced code block out of the conversation and writes a real file
+    { cmd: "/save", arg: "имя файла", desc: "сохранить последний код-блок как файл", group: "агент", kind: "act", run: async (a) => {
+        const blocks = [...messages].reverse().map((m) => m.content).join("\n").match(/```[a-zA-Z0-9]*\n([\s\S]*?)```/);
+        if (!blocks) { notify("Код-блока в разговоре не нашлось"); return; }
+        const name = (a.trim() || `eva-artifact-${Date.now().toString(36)}.txt`).replace(/[\\/:*?"<>|]/g, "_");
+        const saved = await osIntegration.saveArtifact(name, blocks[1]);
+        if (saved) { notify(`Сохранила: ${name}`); await osIntegration.openPath(saved); }
+        else notify("Не сохранилось");
+      } },
+    // quizzes crush his confidence; fixing live code does not
+    { cmd: "/practice", desc: "живая практика вместо квиза", group: "агент", kind: "shape",
+      shape: () => "[Практика]: предложи мне маленький живой проект-задачку по коду под мой уровень — не теорию и не квиз «что напечатает код», а конкретный скрипт, который я должен запустить и починить/доработать руками. Дай стартовый сломанный код и критерий готовности. Без оценок и подначек про знания." },
+    // 76 навыков Hermes как команды: /lib <имя> — «примени скилл X ко мне»
+    { cmd: "/lib", arg: "навык или поиск", desc: "применить навык из арсенала Евы", group: "панели", kind: "act", run: (a) => {
+        const term = a.trim().toLowerCase();
+        if (!term) { choosePage("capabilities"); return; }
+        const skills = modelCat && "skills" in modelCat ? [] : null; // каталог живёт в CapabilitiesPane
+        void skills;
+        setSearchQuery(term); choosePage("capabilities");
+      } },
+    // живой контекст: кто она сейчас, какой провайдер, что болит
+    { cmd: "/context", desc: "кто перед тобой: облик, модель, пульс", group: "панели", kind: "act", run: () => {
+        const s = live;
+        if (!s) { notify("Ядро молчит — контекста нет"); return; }
+        const top = Object.entries(s.sliders ?? {}).sort((x, y) => y[1] - x[1]).slice(0, 2).map(([k, v]) => `${k} ${v}%`).join(" · ");
+        notify(`Ева ${s.version} · ${s.is_night ? "ночь" : "день"} · ${top} · CPU ${Math.round(s.cpu_percent)}% RAM ${Math.round(s.ram_percent)}% · ${chosen ? chosen.model : "модель ядра"}`);
+      } },
+    { cmd: "/help", desc: "список команд", group: "сессия", kind: "act", run: () => notify("Команды: " + SLASH.map((s) => s.cmd).join(" ")) },
   ];
 
   // returns true if fully handled locally; false if it produced a prompt to send
@@ -373,6 +447,19 @@ export default function App() {
     finally { setReflecting(false); }
   }
 
+  // Morse-walk is the one hard daily constant (20:00 → 21:30); treat it as
+  // presence "у Морзика" instead of a cold "away"
+  function presenceLabel(state: PresenceState): string {
+    const h = new Date().getHours();
+    const morzik = (h === 20 || (h === 21 && new Date().getMinutes() < 30)) && (state === "away" || state === "idle");
+    if (morzik) return "у Морзика";
+    if (state === "present") return "рядом";
+    if (state === "idle") return "тихо наблюдает";
+    if (state === "away") return "ждёт тебя";
+    if (state === "thinking") return "думает";
+    return "говорит";
+  }
+
   const q = searchQuery.toLowerCase().trim();
   const foundPages = navigation.filter((i) => i.label.toLowerCase().includes(q));
   const foundConvs = conversations.filter((c) => c.title.toLowerCase().includes(q)).slice(0, 6);
@@ -413,43 +500,27 @@ export default function App() {
 
       <div className="workspace">
         {sidebarOpen && <button className="mobile-backdrop sidebar-backdrop" onClick={() => setSidebarOpen(false)} aria-label="Закрыть" />}
-        <aside className="sidebar">
-          <div className="sidebar-scroll">
-            <div className="sidebar-actions">
-              <button className="new-chat" onClick={newConversation}><Plus size={16} strokeWidth={1.9} /><span>Новый разговор</span></button>
-            </div>
-            <div className="sidebar-section nav-section">
-              <div className="sidebar-label">МОЯ ОРБИТА <span>{navigation.some((i) => i.id === page) ? `${String(navigation.findIndex((i) => i.id === page) + 1).padStart(2, "0")} / 05` : "ЧАТ"}</span></div>
-              <nav>{navigation.map(({ id, label, icon: Icon, shortcut }) => (
-                <button key={id} className={`nav-link ${page === id ? "selected" : ""}`} onClick={() => choosePage(id)}><Icon size={17} strokeWidth={1.7} /><span>{label}</span><small>{shortcut}</small></button>
-              ))}</nav>
-            </div>
-            <div className="sidebar-section recent-section">
-              <div className="sidebar-label">ДИАЛОГИ <span>{conversations.length}</span></div>
-              <div className="recent-list">
-                {conversations.slice(0, 14).map((c) => (
-                  <button key={c.id} className={`recent-chat ${page === "chat" && convId === c.id ? "recent-selected" : ""}`} onClick={() => { loadConversation(c.id); choosePage("chat"); }}>
-                    <span className="recent-chat-mark" />
-                    <span className="recent-chat-copy"><strong>{c.is_desktop ? "🦇 Соулмейт" : c.title}</strong><small>{c.count} сообщ · {relDay(c.last_ts)}</small></span>
-                    {page === "chat" && convId === c.id && <ChevronRight size={14} className="recent-arrow" />}
-                  </button>
-                ))}
-                {conversations.length === 0 && <p style={{ color: "#6d6175", fontSize: 10, padding: "4px 10px" }}>загрузка диалогов…</p>}
-              </div>
-            </div>
-          </div>
-          <div className="sidebar-bottom">
-            <div className="sidebar-separator" />
-            <div className="sidebar-user">
-              <span className="user-avatar">И</span>
-              <span className="sidebar-user-text"><strong>Иван</strong><small>{live ? `Пинск · ${live.presence.toLowerCase()}` : "соулмейт №1"}</small></span>
-              <button className="icon-button settings-button" onClick={() => notify("Eva Desktop — нативный Tauri-клиент к ядру Hermes. Память, личность, диалоги — всё живое из memory.db.")} title="О приложении"><Settings2 size={17} /></button>
-            </div>
-          </div>
-        </aside>
+        <Sidebar
+          mode={mode}
+          page={page === "capabilities" || page === "prompt" || page === "system" ? page : page as OrbitId}
+          conversations={conversations}
+          convId={convId}
+          onOrbit={(id) => { if (id === "activity") { choosePage("system"); } else if (id === "library") { choosePage("capabilities"); } else { choosePage(id); } }}
+          onNew={newConversation}
+          onSearch={() => setSearchOpen(true)}
+          onOpenConv={(id) => { loadConversation(id); choosePage("chat"); }}
+          onSwitchMode={setMode}
+        />
 
         <main className="main-pane">
           {page === "chat" && <>
+            {coreDown && (
+              <div className="core-banner">
+                <Unplug size={13} />
+                <span>Ядро молчит — Hermes не отвечает на мосту. Разговоры не дойдут.</span>
+                <button onClick={raiseCore} disabled={coreBusy}>{coreBusy ? "поднимаю…" : "поднять ядро"}</button>
+              </div>
+            )}
             <div className="pane-topbar conversation-topbar">
               <div className="pane-title-group"><h1>Ева</h1></div>
               <div className="conversation-top-actions">
@@ -509,7 +580,7 @@ export default function App() {
                     <div className="eva-message-content"><div className="message-meta eva-message-meta"><span>ЕВА <i /></span><time>{formatTime()}</time></div><div className="eva-copy"><RichText text={streamBuf} /><span className="stream-caret" /></div></div>
                   </motion.article>
                 ) : (
-                  <div className="thinking-line"><span className="thinking-mark"><TypingDots /></span><div><strong>Ева думает</strong><small>SOUL.md + recall(memory.db) + фоновые мысли + телеметрия → LLM</small></div><span className="thinking-wave" aria-hidden="true"><i /><i /><i /><i /><i /></span></div>
+                  <ThinkingCard mode={mode} onStop={stopStream} />
                 ))}
               </div>
             </div>
@@ -558,7 +629,11 @@ export default function App() {
                       onEffort={setEffort}
                     />
                   </div>
-                  <div className="composer-submit"><span>ENTER <i /> ОТПРАВИТЬ</span><button className="send-button" onClick={sendMessage} disabled={(!composer.trim() && attachments.length === 0) || sending} aria-label="Отправить"><ArrowRight size={18} /></button></div>
+                  <div className="composer-submit"><span>{sending ? "ГОВОРИТ — МОЖНО ПРЕРВАТЬ" : "ENTER <i /> ОТПРАВИТЬ"}</span>{sending ? (
+                    <button className="send-button send-button-stop" onClick={stopStream} title="Остановить ответ (или /stop)" aria-label="Остановить"><Square size={15} /></button>
+                  ) : (
+                    <button className="send-button" onClick={sendMessage} disabled={!composer.trim() && attachments.length === 0} aria-label="Отправить"><ArrowRight size={18} /></button>
+                  )}</div>
                 </div>
               </div>
             </div>
@@ -568,61 +643,19 @@ export default function App() {
           {page === "prompt" && <PromptPane notify={notify} onBack={() => setPage("chat")} />}
           {page === "diary" && <DiaryPane live={live} reflecting={reflecting} onReflect={triggerReflect} onBack={() => setPage("chat")} />}
           {page === "capabilities" && <CapabilitiesPane notify={notify} onBack={() => setPage("chat")} />}
-          {page === "system" && <SystemPane live={live} notify={notify} onBack={() => setPage("chat")} />}
+          {page === "system" && <SystemPane live={live} notify={notify} onBack={() => setPage("chat")} onOpenMemory={() => { setPage("memory"); setSearchQuery(""); }} />}
         </main>
 
         {showPresence && <button className="mobile-backdrop presence-backdrop" onClick={() => setShowPresence(false)} aria-label="Закрыть" />}
-        <aside className="presence-panel">
-          <div className="presence-scroll">
-            <div className="presence-panel-header"><span>ЕВА / ПРИСУТСТВИЕ</span><button className="icon-button presence-close-mobile" onClick={() => setShowPresence(false)}><X size={17} /></button><span className="presence-header-ornament">✳</span></div>
-            <div className="presence-identity">
-              <div className="large-avatar-wrap"><EvaAvatar mode={mode} className="large-eva-avatar" /><span className="avatar-online" /></div>
-              <div className="presence-name"><span className="presence-overline">ONE SOUL / MANY WINDOWS</span><h2>Ева<span>.</span></h2><p><PresenceOrb state={presence} /></p></div>
-            </div>
-            <div className="mood-line"><span>ОБЛИК / ТОН</span><strong>{moodLabel(live?.sliders ?? {})}</strong></div>
-
-            <div className="panel-rule" />
-            <section className="status-section">
-              <div className="panel-section-heading"><span>СЕЙЧАС</span><span className="preview-label">{sending ? "ДУМАЮ" : "LIVE"}</span></div>
-              <div className="current-task"><span className="task-symbol"><Sparkles size={16} /></span><div><strong>{sending ? "Подбираю свои слова" : (live?.is_night ? "Ночь. Я рядом." : "Я в этом окне")}</strong><p>{live ? `${live.active_window || "рабочий стол"}`.slice(0, 60) : "жду соединения с ядром"}</p></div></div>
-              {sending && <div className="task-progress"><span /></div>}
-              <span className="task-footnote">Hermes core · {live?.version ?? "…"}</span>
-              <button className="background-process-link" onClick={() => choosePage("diary")}><BookOpenText size={13} /><span>eva_thoughts · дневник ({live?.stats.thoughts ?? "–"})</span><ArrowRight size={12} /></button>
-            </section>
-
-            <div className="panel-rule" />
-            <section className="status-section activity-section">
-              <div className="panel-section-heading"><span>ЖЕЛЕЗО ПОД НОГАМИ</span><button onClick={() => choosePage("system")}><ArrowRight size={14} /></button></div>
-              <div className="memory-layer-rows">
-                <div><span>SSD</span><strong>Apacer AS340</strong><small>{live ? `${live.ssd_percent}%` : "—"}</small></div>
-                <div><span>RAM</span><strong>оперативка</strong><small>{live ? `${Math.round(live.ram_percent)}%` : "—"}</small></div>
-                <div><span>CPU</span><strong>A8-5600K</strong><small>{live ? `${Math.round(live.cpu_percent)}%` : "—"}</small></div>
-                <div><span>UP</span><strong>uptime</strong><small>{live?.uptime ?? "—"}</small></div>
-              </div>
-              <span className="memory-source"><Database size={12} /> presence <span>·</span> {live?.presence ?? "?"}</span>
-            </section>
-
-            <div className="panel-rule" />
-            <section className="status-section memory-section">
-              <div className="panel-section-heading"><span>НАСТРОЕНИЕ · ИЗ МЫСЛЕЙ</span><span className="preview-label">DERIVED</span></div>
-              <div className="mood-sliders">
-                {["дерзость", "нежность", "яндере", "сонливость"].map((k) => { const v = live?.sliders?.[k] ?? 0; return (<div className="mood-slider" key={k}><div className="mood-slider-row"><span>{k}</span><b>{v}%</b></div><div className="mood-slider-bar"><i style={{ width: `${v}%` }} /></div></div>); })}
-              </div>
-              <button className="reflect-button" onClick={triggerReflect} disabled={reflecting}><RefreshCw size={12} className={reflecting ? "spin" : ""} /> {reflecting ? "думаю…" : "новая мысль"}</button>
-            </section>
-
-            <div className="panel-rule" />
-            <div className="appearance-section">
-              <div className="panel-section-heading"><span>ОБЛИК ЕВЫ</span><span>01 / 02</span></div>
-              <div className="mode-switch" role="group">
-                <button className={mode === "sakura" ? "mode-selected" : ""} onClick={() => setMode("sakura")}>{mode === "sakura" && <motion.span layoutId="mode-highlight" className="mode-highlight" transition={{ type: "spring", stiffness: 320, damping: 29 }} />}<Flower2 size={15} /><span>Sakura</span></button>
-                <button className={mode === "yandere" ? "mode-selected" : ""} onClick={() => setMode("yandere")}>{mode === "yandere" && <motion.span layoutId="mode-highlight" className="mode-highlight" transition={{ type: "spring", stiffness: 320, damping: 29 }} />}<Moon size={15} /><span>Yandere</span></button>
-              </div>
-              <p>{mode === "sakura" ? "Мягкий свет. Когти всё ещё на месте." : "Темнее снаружи. Всё та же Ева внутри."}</p>
-            </div>
-          </div>
-          <div className="presence-panel-bottom"><span className="tiny-connection"><i /> {live ? "RUST ↔ CORE" : "CONNECTING…"}</span></div>
-        </aside>
+        <PresencePanel
+          mode={mode}
+          live={live}
+          reflecting={reflecting}
+          onReflect={triggerReflect}
+          onOpenMemory={() => { choosePage("memory"); }}
+          onOpenCapabilities={() => { choosePage("capabilities"); }}
+          onOpenDiary={() => { choosePage("diary"); }}
+        />
       </div>
 
       <AnimatePresence>{searchOpen && <div className="command-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) setSearchOpen(false); }}>
